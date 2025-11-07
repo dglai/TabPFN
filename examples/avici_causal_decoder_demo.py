@@ -1,7 +1,6 @@
 import random
-from dataclasses import dataclass
-from typing import Optional, Any, Callable, TypeVar
-import time
+from dataclasses import dataclass, asdict
+from typing import Optional, Any, Callable, TypeVar, cast
 
 import numpy as np
 import torch
@@ -19,6 +18,13 @@ def override(func: Fn) -> Fn:  # type: ignore[misc]
 # (No direct need for get_architecture/ModelConfig when loading pretrained)
 from tabpfn.model_loading import load_model_criterion_config
 
+# Weights & Biases logging (assumed installed and always enabled)
+import wandb
+
+# Global wandb run and base-step offset for logging across instances
+WB_RUN: Optional[wandb.Run] = None
+WB_BASE_STEP_OFFSET: int = 0
+
 
 def set_seed(seed: int = 0) -> None:
     random.seed(seed)
@@ -35,10 +41,17 @@ class DemoConfig:
     n_interv_obs: int = 500  # half observational, half interventional (like paper)
     n_interv_vars: int = 4  # intervene on ALL variables (n_interv_vars: -1 in AVICI config means all)
     # Evaluation
-    n_test_instances: int = 10  # number of test instances to average over
+    n_test_instances: int = 1  # number of test instances to average over
     decision_threshold: float = 0.5  # threshold for converting probabilities to binary predictions
     # Always load official TabPFN-v2 classifier weights; no fallback to random init
     model_path: Optional[str] = None  # keep None to auto-download/cache
+
+    # Logging (evaluation/monitoring)
+    wandb_enabled: bool = True
+    wandb_project: str = "tabpfn-avici-demo"
+    wandb_run_name: Optional[str] = None
+    wandb_group: Optional[str] = None
+    wandb_notes: Optional[str] = None
 
 
 @dataclass
@@ -63,6 +76,21 @@ class Hyperparameters:
     acyclicity_inner_step: int = 500  # AVICI default: update dual every 500 steps
     acyclicity_warmup: int = 1000  # warmup steps for dual schedule
     power_iters: int = 10  # AVICI default: 10 power iterations
+
+
+def init_wandb(cfg: DemoConfig, h: Hyperparameters):
+    """Initialize a Weights & Biases run (always enabled) and store it globally."""
+    global WB_RUN
+    WB_RUN = wandb.init(
+        project=cfg.wandb_project,
+        name=cfg.wandb_run_name,
+        group=cfg.wandb_group,
+        notes=cfg.wandb_notes,
+        config={
+            "demo": asdict(cfg),
+            "hparams": asdict(h),
+        },
+    )
 
 
 # ----------------------------
@@ -548,7 +576,7 @@ def train_demo(cfg: DemoConfig, h: Hyperparameters) -> dict[str, float]:
     # Sample interventional data
     rng = np.random.default_rng(seed=None)
     interv_vars = sorted(rng.choice(cfg.n_vars, size=cfg.n_interv_vars, replace=False).tolist())
-    print(f"Intervening on variables: {interv_vars}")
+    # No console logging
     
     X_np, interv_mask = sample_interventional_data(
         A, W, 
@@ -559,8 +587,7 @@ def train_demo(cfg: DemoConfig, h: Hyperparameters) -> dict[str, float]:
         seed=None
     )
     
-    print(f"Data shape: {X_np.shape}, Intervention mask shape: {interv_mask.shape}")
-    print(f"Interventional samples: {interv_mask.sum(axis=0).astype(int)}")
+    # No console logging
 
     # 2) Backbone
     model = build_tabpfn_backbone(cfg).to(h.device)
@@ -568,7 +595,7 @@ def train_demo(cfg: DemoConfig, h: Hyperparameters) -> dict[str, float]:
     for p in model.parameters():
         p.requires_grad_(False)
     
-    print(f"Model features_per_group: {model.features_per_group}")
+    # No console logging
 
     # 3) Decoder — match the backbone's actual embedding size
     emb_dim = int(getattr(model, "ninp", h.emsize))
@@ -583,7 +610,6 @@ def train_demo(cfg: DemoConfig, h: Hyperparameters) -> dict[str, float]:
     # Initialize dual variable for dual acyclicity scheduling
     dual = torch.tensor(0.0, device=h.device, dtype=torch.float32)
 
-    t0 = time.time()
     # 5) Train loop (decoder only)
     for step in range(h.steps):
         opt.zero_grad(set_to_none=True)
@@ -637,24 +663,27 @@ def train_demo(cfg: DemoConfig, h: Hyperparameters) -> dict[str, float]:
                 with torch.no_grad():
                     dual = dual + h.acyclicity_dual_lr * acyc_penalty
 
-        if (step + 1) % max(1, h.steps // 10) == 0:
-            tt = time.time()
+        # Log to wandb every step (no console logging)
+        if WB_RUN is not None:
             with torch.no_grad():
                 probs = torch.sigmoid(logits)[0]
-                # Simple progress metric: mean absolute error of probabilities at GT edges vs non-edges
                 pos_mae = (probs[G_t[0] > 0] - 1.0).abs().mean().item() if (G_t[0] > 0).any() else 0.0
                 neg_mae = (probs[G_t[0] == 0] - 0.0).abs().mean().item()
-            
-            log_str = f"Step {step+1:04d} | loss={loss.item():.4f} | bce={bce.item():.4f} | acyc_raw={acyc_penalty.item():.4f} | acyc_wgt={wgt_acyc.item():.4f}"
+            log_payload = {
+                "loss": float(loss.item()),
+                "bce": float(bce.item()),
+                "acyclicity/raw": float(acyc_penalty.item()),
+                "acyclicity/weight": float(acyc_weight),
+                "acyclicity/weighted": float(wgt_acyc.item()),
+                "metrics/pos_mae": float(pos_mae),
+                "metrics/neg_mae": float(neg_mae),
+                "hp/lr": float(h.lr),
+                "hp/weight_decay": float(h.weight_decay),
+                "step": int(WB_BASE_STEP_OFFSET + step + 1),
+            }
             if h.acyclicity_schedule == "dual":
-                log_str += f" | dual={dual.item():.4f}"
-            log_str += f" | pos_mae={pos_mae:.3f} | neg_mae={neg_mae:.3f}"
-            print(log_str)
-            print(f"  Non-edge probs (max 5): {probs[G_t[0] == 0].sort()[0][-5:].cpu().numpy()}")
-            print(f"  Edge probs (min 5):     {probs[G_t[0] > 0].sort()[0][:5].cpu().numpy()}")
-            print(f"  Time for {max(1, h.steps // 100)} steps: {tt - t0:.2f} sec")
-            t0 = time.time()
-
+                log_payload["acyclicity/dual"] = float(dual.item())
+            cast(Any, WB_RUN).log(log_payload, step=WB_BASE_STEP_OFFSET + step + 1)
     # 6) Final evaluation
     with torch.no_grad():
         node_emb = get_node_embeddings_from_tabpfn(model, X_np, interv_mask)
@@ -668,72 +697,59 @@ def train_demo(cfg: DemoConfig, h: Hyperparameters) -> dict[str, float]:
         metrics = compute_f1_score(G, G_pred)
         metrics['sid'] = SID(G, G_pred)
 
-        print(G)
-        print(G_pred)
+    # No console logging
         
-        return metrics
+        # Final logging to wandb (summary)
+        if WB_RUN is not None:
+            cast(Any, WB_RUN).log({
+                "final/precision": float(metrics['precision']),
+                "final/recall": float(metrics['recall']),
+                "final/f1": float(metrics['f1']),
+                "final/sid": float(metrics['sid']),
+            }, step=WB_BASE_STEP_OFFSET + h.steps)
+    return metrics
 
 
 def run_benchmark(cfg: DemoConfig, h: Hyperparameters) -> None:
-    """Run multiple test instances and report average F1 score."""
-    print("=" * 80)
-    print(f"AVICI-style Causal Discovery Benchmark")
-    print(f"Configuration: d={cfg.n_vars} variables, n={cfg.n_obs} observations")
-    print(f"  - Observational: {cfg.n_obs - cfg.n_interv_obs}")
-    print(f"  - Interventional: {cfg.n_interv_obs} (on {cfg.n_interv_vars} variables)")
-    print(f"  - Decision threshold: {cfg.decision_threshold}")
-    print(f"  - Test instances: {cfg.n_test_instances}")
-    print(f"\nLoss Configuration (matching AVICI):")
-    print(f"  - Label smoothing: {h.label_smoothing}")
-    print(f"  - Positive weight: {h.pos_weight}")
-    print(f"  - Acyclicity schedule: {h.acyclicity_schedule}")
-    print(f"  - Acyclicity weight: {h.acyclicity_weight}")
-    if h.acyclicity_schedule == "linear":
-        print(f"  - Linear rate: {h.acyclicity_linear_rate}, burnin: {h.acyclicity_burnin}")
-    elif h.acyclicity_schedule == "dual":
-        print(f"  - Dual lr: {h.acyclicity_dual_lr}, inner_step: {h.acyclicity_inner_step}, warmup: {h.acyclicity_warmup}")
-    print(f"  - Power iterations: {h.power_iters} (log-space)")
-    print("=" * 80)
-    
+    """Run multiple test instances and log results to wandb only."""
+    # no console logging
+
     all_metrics = []
+    # Initialize wandb once per benchmark run
+    init_wandb(cfg, h)
     
     for instance in range(cfg.n_test_instances):
-        print(f"\n{'='*80}")
-        print(f"Test Instance {instance + 1}/{cfg.n_test_instances}")
-        print(f"{'='*80}")
-        
         # # Use different seed for each instance
         # set_seed(instance * 100)
         
+        base_step = instance * h.steps
+        # update global base-step offset for logging within this instance
+        global WB_BASE_STEP_OFFSET
+        WB_BASE_STEP_OFFSET = base_step
         metrics = train_demo(cfg, h)
         all_metrics.append(metrics)
-        
-        print(f"\nInstance {instance + 1} Results:")
-        print(f"  Precision: {metrics['precision']:.4f}")
-        print(f"  Recall:    {metrics['recall']:.4f}")
-        print(f"  F1 Score:  {metrics['f1']:.4f}")
-        print(f"  TP/FP/FN:  {metrics['tp']}/{metrics['fp']}/{metrics['fn']}")
+    # no per-instance console output
     
     # Compute statistics across all instances
-    print(f"\n{'='*80}")
-    print(f"FINAL RESULTS (averaged over {cfg.n_test_instances} instances)")
-    print(f"{'='*80}")
-    
     f1_scores = [m['f1'] for m in all_metrics]
     precision_scores = [m['precision'] for m in all_metrics]
     recall_scores = [m['recall'] for m in all_metrics]
     sid_scores = [m['sid'] for m in all_metrics]
+    # no final console output
 
-    print(f"SID:      {np.mean(sid_scores):.4f} ± {np.std(sid_scores):.4f}")
-    print(f"\nF1 Score:  {np.mean(f1_scores):.4f} ± {np.std(f1_scores):.4f}")
-    print(f"Precision: {np.mean(precision_scores):.4f} ± {np.std(precision_scores):.4f}")
-    print(f"Recall:    {np.mean(recall_scores):.4f} ± {np.std(recall_scores):.4f}")
-    
-    print(f"\nComparison to AVICI paper (Table A.2, in-distribution LINEAR):")
-    print(f"  AVICI (obs only):  SID = 178.2 ± 36.9,  F1 = 0.828 ± 0.03")
-    print(f"  AVICI (with int):  SID =  72.4 ± 20.7,  F1 = 0.948 ± 0.01")
-    print(f"  TabPFN-AVICI:      SID = {np.mean(sid_scores):5.1f} ± {np.std(sid_scores):4.1f},  F1 = {np.mean(f1_scores):.3f} ± {np.std(f1_scores):.2f}")
-    print(f"\n{'='*80}")
+    # Log aggregate results to wandb and close run
+    if WB_RUN is not None:
+        cast(Any, WB_RUN).log({
+            "aggregate/SID_mean": float(np.mean(sid_scores)),
+            "aggregate/SID_std": float(np.std(sid_scores)),
+            "aggregate/F1_mean": float(np.mean(f1_scores)),
+            "aggregate/F1_std": float(np.std(f1_scores)),
+            "aggregate/Precision_mean": float(np.mean(precision_scores)),
+            "aggregate/Precision_std": float(np.std(precision_scores)),
+            "aggregate/Recall_mean": float(np.mean(recall_scores)),
+            "aggregate/Recall_std": float(np.std(recall_scores)),
+        })
+        cast(Any, WB_RUN).finish()
 
 
 if __name__ == "__main__":
