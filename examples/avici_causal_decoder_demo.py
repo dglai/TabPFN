@@ -34,13 +34,19 @@ class DemoConfig:
     edge_prob: float = 2 / 30  # 2 / 30 edges_per_var=2 on average for d=30
     n_interv_obs: int = 500  # half observational, half interventional (like paper)
     n_interv_vars: int = 4  # intervene on ALL variables (n_interv_vars: -1 in AVICI config means all)
+    # Evaluation
+    n_test_instances: int = 10  # number of test instances to average over
+    decision_threshold: float = 0.5  # threshold for converting probabilities to binary predictions
+    # Always load official TabPFN-v2 classifier weights; no fallback to random init
+    model_path: Optional[str] = None  # keep None to auto-download/cache
+
+
+@dataclass
+class Hyperparameters:
     # Model/backbone
     emsize: int = 64
     nhead: int = 8
     nlayers: int = 4
-    # Note: features_per_group is loaded from checkpoint (=2), not set here
-    # Always load official TabPFN-v2 classifier weights; no fallback to random init
-    model_path: Optional[str] = None  # keep None to auto-download/cache
     # Train (matching AVICI defaults)
     lr: float = 2e-4  # AVICI default learning rate
     weight_decay: float = 0.0  # AVICI default (LAMB optimizer handles weight decay)
@@ -57,9 +63,6 @@ class DemoConfig:
     acyclicity_inner_step: int = 500  # AVICI default: update dual every 500 steps
     acyclicity_warmup: int = 1000  # warmup steps for dual schedule
     power_iters: int = 10  # AVICI default: 10 power iterations
-    # Evaluation
-    n_test_instances: int = 10  # number of test instances to average over
-    decision_threshold: float = 0.5  # threshold for converting probabilities to binary predictions
 
 
 # ----------------------------
@@ -530,7 +533,7 @@ def compute_f1_score(y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, float]
 # Training demo
 # ----------------------------
 
-def train_demo(cfg: DemoConfig) -> dict[str, float]:
+def train_demo(cfg: DemoConfig, h: Hyperparameters) -> dict[str, float]:
     # 1) Data - Generate observational + interventional data
     A = sample_dag(cfg.n_vars, cfg.edge_prob, seed=None)
     
@@ -560,7 +563,7 @@ def train_demo(cfg: DemoConfig) -> dict[str, float]:
     print(f"Interventional samples: {interv_mask.sum(axis=0).astype(int)}")
 
     # 2) Backbone
-    model = build_tabpfn_backbone(cfg).to(cfg.device)
+    model = build_tabpfn_backbone(cfg).to(h.device)
     model.eval()  # freeze backbone for the demo
     for p in model.parameters():
         p.requires_grad_(False)
@@ -568,21 +571,21 @@ def train_demo(cfg: DemoConfig) -> dict[str, float]:
     print(f"Model features_per_group: {model.features_per_group}")
 
     # 3) Decoder — match the backbone's actual embedding size
-    emb_dim = int(getattr(model, "ninp", cfg.emsize))
-    decoder = CausalGraphDecoder(emb_dim).to(cfg.device)
-    opt = optim.AdamW(decoder.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
+    emb_dim = int(getattr(model, "ninp", h.emsize))
+    decoder = CausalGraphDecoder(emb_dim).to(h.device)
+    opt = optim.AdamW(decoder.parameters(), lr=h.lr, weight_decay=h.weight_decay)
 
     # 4) Prepare tensors
     X_np = X_np.astype(np.float32)
     interv_mask = interv_mask.astype(np.float32)
-    G_t = torch.as_tensor(G, device=cfg.device, dtype=torch.float32).unsqueeze(0)  # [1,D,D]
+    G_t = torch.as_tensor(G, device=h.device, dtype=torch.float32).unsqueeze(0)  # [1,D,D]
     
     # Initialize dual variable for dual acyclicity scheduling
-    dual = torch.tensor(0.0, device=cfg.device, dtype=torch.float32)
+    dual = torch.tensor(0.0, device=h.device, dtype=torch.float32)
 
     t0 = time.time()
     # 5) Train loop (decoder only)
-    for step in range(cfg.steps):
+    for step in range(h.steps):
         opt.zero_grad(set_to_none=True)
         # node embeddings from TabPFN backbone (now with intervention information)
         node_emb = get_node_embeddings_from_tabpfn(model, X_np, interv_mask)  # [1,n_vars,E]
@@ -593,35 +596,35 @@ def train_demo(cfg: DemoConfig) -> dict[str, float]:
         n_vars = logits.size(-1)
         
         # Apply label smoothing to targets
-        y_soft = (1 - cfg.label_smoothing) * G_t + cfg.label_smoothing / 2.0
+        y_soft = (1 - h.label_smoothing) * G_t + h.label_smoothing / 2.0
         
         # Compute log probabilities
         logp1 = F.logsigmoid(logits)
         logp0 = F.logsigmoid(-logits)
         
         # Binary cross-entropy with positive weighting
-        xent_eltwise = -(cfg.pos_weight * y_soft * logp1 + (1 - y_soft) * logp0)
+        xent_eltwise = -(h.pos_weight * y_soft * logp1 + (1 - y_soft) * logp0)
         
         # Mask diagonal and normalize by number of edges (AVICI style)
         xent_masked = xent_eltwise.masked_fill(diag_mask.unsqueeze(0), 0.0)
         bce = xent_masked.sum() / (n_vars * (n_vars - 1))
         
         # Acyclicity penalty in log-space (AVICI style)
-        acyc_penalty = acyclicity_penalty_from_logits(logits, iters=cfg.power_iters).mean()
+        acyc_penalty = acyclicity_penalty_from_logits(logits, iters=h.power_iters).mean()
         
         # Adaptive acyclicity weight scheduling (matching AVICI)
-        if cfg.acyclicity_schedule == "const":
-            acyc_weight = cfg.acyclicity_weight
-        elif cfg.acyclicity_schedule == "linear":
-            acyc_weight = cfg.acyclicity_weight * max(0.0, (step - cfg.acyclicity_burnin) * cfg.acyclicity_linear_rate)
-        elif cfg.acyclicity_schedule == "dual":
+        if h.acyclicity_schedule == "const":
+            acyc_weight = h.acyclicity_weight
+        elif h.acyclicity_schedule == "linear":
+            acyc_weight = h.acyclicity_weight * max(0.0, (step - h.acyclicity_burnin) * h.acyclicity_linear_rate)
+        elif h.acyclicity_schedule == "dual":
             # Dual ascent (augmented Lagrangian)
-            if step >= cfg.acyclicity_warmup:
-                acyc_weight = cfg.acyclicity_weight * dual.item()
+            if step >= h.acyclicity_warmup:
+                acyc_weight = h.acyclicity_weight * dual.item()
             else:
                 acyc_weight = 0.0
         else:
-            raise ValueError(f"Unknown acyclicity schedule: {cfg.acyclicity_schedule}")
+            raise ValueError(f"Unknown acyclicity schedule: {h.acyclicity_schedule}")
         
         wgt_acyc = acyc_weight * acyc_penalty
         loss = bce + wgt_acyc
@@ -629,12 +632,12 @@ def train_demo(cfg: DemoConfig) -> dict[str, float]:
         opt.step()
         
         # Update dual variable (for dual schedule) - only every inner_step iterations
-        if cfg.acyclicity_schedule == "dual" and step >= cfg.acyclicity_warmup:
-            if (step - cfg.acyclicity_warmup) % cfg.acyclicity_inner_step == 0:
+        if h.acyclicity_schedule == "dual" and step >= h.acyclicity_warmup:
+            if (step - h.acyclicity_warmup) % h.acyclicity_inner_step == 0:
                 with torch.no_grad():
-                    dual = dual + cfg.acyclicity_dual_lr * acyc_penalty
+                    dual = dual + h.acyclicity_dual_lr * acyc_penalty
 
-        if (step + 1) % max(1, cfg.steps // 10) == 0:
+        if (step + 1) % max(1, h.steps // 10) == 0:
             tt = time.time()
             with torch.no_grad():
                 probs = torch.sigmoid(logits)[0]
@@ -643,13 +646,13 @@ def train_demo(cfg: DemoConfig) -> dict[str, float]:
                 neg_mae = (probs[G_t[0] == 0] - 0.0).abs().mean().item()
             
             log_str = f"Step {step+1:04d} | loss={loss.item():.4f} | bce={bce.item():.4f} | acyc_raw={acyc_penalty.item():.4f} | acyc_wgt={wgt_acyc.item():.4f}"
-            if cfg.acyclicity_schedule == "dual":
+            if h.acyclicity_schedule == "dual":
                 log_str += f" | dual={dual.item():.4f}"
             log_str += f" | pos_mae={pos_mae:.3f} | neg_mae={neg_mae:.3f}"
             print(log_str)
             print(f"  Non-edge probs (max 5): {probs[G_t[0] == 0].sort()[0][-5:].cpu().numpy()}")
             print(f"  Edge probs (min 5):     {probs[G_t[0] > 0].sort()[0][:5].cpu().numpy()}")
-            print(f"  Time for {max(1, cfg.steps // 100)} steps: {tt - t0:.2f} sec")
+            print(f"  Time for {max(1, h.steps // 100)} steps: {tt - t0:.2f} sec")
             t0 = time.time()
 
     # 6) Final evaluation
@@ -671,7 +674,7 @@ def train_demo(cfg: DemoConfig) -> dict[str, float]:
         return metrics
 
 
-def run_benchmark(cfg: DemoConfig) -> None:
+def run_benchmark(cfg: DemoConfig, h: Hyperparameters) -> None:
     """Run multiple test instances and report average F1 score."""
     print("=" * 80)
     print(f"AVICI-style Causal Discovery Benchmark")
@@ -681,15 +684,15 @@ def run_benchmark(cfg: DemoConfig) -> None:
     print(f"  - Decision threshold: {cfg.decision_threshold}")
     print(f"  - Test instances: {cfg.n_test_instances}")
     print(f"\nLoss Configuration (matching AVICI):")
-    print(f"  - Label smoothing: {cfg.label_smoothing}")
-    print(f"  - Positive weight: {cfg.pos_weight}")
-    print(f"  - Acyclicity schedule: {cfg.acyclicity_schedule}")
-    print(f"  - Acyclicity weight: {cfg.acyclicity_weight}")
-    if cfg.acyclicity_schedule == "linear":
-        print(f"  - Linear rate: {cfg.acyclicity_linear_rate}, burnin: {cfg.acyclicity_burnin}")
-    elif cfg.acyclicity_schedule == "dual":
-        print(f"  - Dual lr: {cfg.acyclicity_dual_lr}, inner_step: {cfg.acyclicity_inner_step}, warmup: {cfg.acyclicity_warmup}")
-    print(f"  - Power iterations: {cfg.power_iters} (log-space)")
+    print(f"  - Label smoothing: {h.label_smoothing}")
+    print(f"  - Positive weight: {h.pos_weight}")
+    print(f"  - Acyclicity schedule: {h.acyclicity_schedule}")
+    print(f"  - Acyclicity weight: {h.acyclicity_weight}")
+    if h.acyclicity_schedule == "linear":
+        print(f"  - Linear rate: {h.acyclicity_linear_rate}, burnin: {h.acyclicity_burnin}")
+    elif h.acyclicity_schedule == "dual":
+        print(f"  - Dual lr: {h.acyclicity_dual_lr}, inner_step: {h.acyclicity_inner_step}, warmup: {h.acyclicity_warmup}")
+    print(f"  - Power iterations: {h.power_iters} (log-space)")
     print("=" * 80)
     
     all_metrics = []
@@ -702,7 +705,7 @@ def run_benchmark(cfg: DemoConfig) -> None:
         # # Use different seed for each instance
         # set_seed(instance * 100)
         
-        metrics = train_demo(cfg)
+        metrics = train_demo(cfg, h)
         all_metrics.append(metrics)
         
         print(f"\nInstance {instance + 1} Results:")
@@ -735,4 +738,5 @@ def run_benchmark(cfg: DemoConfig) -> None:
 
 if __name__ == "__main__":
     cfg = DemoConfig()
-    run_benchmark(cfg)
+    h = Hyperparameters()
+    run_benchmark(cfg, h)
