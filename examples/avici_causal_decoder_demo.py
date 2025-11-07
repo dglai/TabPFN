@@ -31,9 +31,9 @@ class DemoConfig:
     # Data - matching AVICI LINEAR test:train configuration exactly
     n_vars: int = 30  # d=30 from paper
     n_obs: int = 1000  # n=1000 total observations (500 obs + 500 int)
-    edge_prob: float = 2.0 / 30.0  # edges_per_var=2 on average for d=30
+    edge_prob: float = 2 / 30  # 2 / 30 edges_per_var=2 on average for d=30
     n_interv_obs: int = 500  # half observational, half interventional (like paper)
-    n_interv_vars: int = 30  # intervene on ALL variables (n_interv_vars: -1 in AVICI config means all)
+    n_interv_vars: int = 4  # intervene on ALL variables (n_interv_vars: -1 in AVICI config means all)
     # Model/backbone
     emsize: int = 64
     nhead: int = 8
@@ -41,16 +41,24 @@ class DemoConfig:
     # Note: features_per_group is loaded from checkpoint (=2), not set here
     # Always load official TabPFN-v2 classifier weights; no fallback to random init
     model_path: Optional[str] = None  # keep None to auto-download/cache
-    # Train
-    lr: float = 1e-3
-    weight_decay: float = 0.0
-    steps: int = 5000
+    # Train (matching AVICI defaults)
+    lr: float = 2e-4  # AVICI default learning rate
+    weight_decay: float = 0.0  # AVICI default (LAMB optimizer handles weight decay)
+    steps: int = 10000
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
-    # Causal loss
-    acyclicity_weight: float = 1.0
-    power_iters: int = 10
+    # Causal loss (matching AVICI defaults)
+    label_smoothing: float = 0.0  # AVICI default: no label smoothing
+    pos_weight: float = 1.0  # AVICI default: no positive class weighting
+    acyclicity_weight: float = 1.0  # AVICI default base weight
+    acyclicity_schedule: str = "dual"  # AVICI default: dual ascent (augmented Lagrangian)
+    acyclicity_burnin: int = 50000  # AVICI default burnin (for linear schedule)
+    acyclicity_linear_rate: float = 1.0  # AVICI default linear rate
+    acyclicity_dual_lr: float = 1e-4  # AVICI default: 1e-4 (not 0.01!)
+    acyclicity_inner_step: int = 500  # AVICI default: update dual every 500 steps
+    acyclicity_warmup: int = 1000  # warmup steps for dual schedule
+    power_iters: int = 10  # AVICI default: 10 power iterations
     # Evaluation
-    n_test_instances: int = 1  # number of test instances to average over
+    n_test_instances: int = 10  # number of test instances to average over
     decision_threshold: float = 0.5  # threshold for converting probabilities to binary predictions
 
 
@@ -236,45 +244,80 @@ class CausalGraphDecoder(nn.Module):
 # Acyclicity penalty (No BEARS-inspired, PyTorch)
 # ----------------------------
 
-def spectral_radius_power_iteration(mat: torch.Tensor, iters: int = 10) -> torch.Tensor:
-    """Estimate largest eigenvalue (spectral radius) of a non-negative matrix.
 
-    mat: [B, D, D] non-negative (we'll feed probabilities)
-    Returns: [B] largest eigenvalue estimate per batch
+
+
+def exp_matmul(logmat: torch.Tensor, vec: torch.Tensor, axis: int) -> torch.Tensor:
+    """Matrix-vector multiplication in log-space: exp(logmat) @ vec or vec @ exp(logmat).
+    
+    Matches AVICI's exp_matmul for numerical stability in acyclicity computation.
+    
+    Args:
+        logmat: [B, D, D] log-probabilities
+        vec: [B, D] vector
+        axis: -1 for right multiply (vec @ exp(logmat)), -2 for left multiply (exp(logmat) @ vec)
+    
+    Returns:
+        [B, D] result of multiplication
     """
-    B, D, _ = mat.shape
-    # Start with random vectors
-    u = torch.rand(B, D, device=mat.device, dtype=mat.dtype)
-    v = torch.rand(B, D, device=mat.device, dtype=mat.dtype)
-    for _ in range(iters):
-        # u <- u @ mat (right eigenvector), v <- mat @ v (left eigenvector)
-        u = torch.matmul(u, mat)  # [B, D]
-        v = torch.matmul(mat, v.unsqueeze(-1)).squeeze(-1)  # [B, D]
-        # Normalize
-        u = u / (u.norm(dim=-1, keepdim=True) + 1e-12)
-        v = v / (v.norm(dim=-1, keepdim=True) + 1e-12)
-    # Rayleigh quotient approximation: (u @ (mat @ v)) / (u @ v)
-    num = torch.sum(u * torch.matmul(mat, v.unsqueeze(-1)).squeeze(-1), dim=-1)
-    den = torch.sum(u * v, dim=-1).clamp_min(1e-12)
-    return num / den
+    if axis == -1:
+        # vec @ exp(logmat): sum over second-to-last dimension
+        # logmat: [B, D, D], vec: [B, D] -> [B, D, 1] @ [B, D, D] -> [B, D, D] -> sum -> [B, D]
+        weighted = logmat + vec.unsqueeze(-1)  # [B, D, D]
+        result = torch.logsumexp(weighted, dim=-2)  # [B, D]
+        return torch.exp(result)
+    elif axis == -2:
+        # exp(logmat) @ vec: sum over last dimension
+        # logmat: [B, D, D], vec: [B, D] -> [B, D, D] @ [B, D, 1] -> [B, D, D] -> sum -> [B, D]
+        weighted = logmat + vec.unsqueeze(-2)  # [B, D, D]
+        result = torch.logsumexp(weighted, dim=-1)  # [B, D]
+        return torch.exp(result)
+    else:
+        raise ValueError(f"Invalid axis {axis}")
 
 
 def acyclicity_penalty_from_logits(logits: torch.Tensor, iters: int = 10) -> torch.Tensor:
-    """Compute acyclicity penalty ala AVICI on edge logits.
-
-    1) Convert to probabilities with sigmoid
-    2) Zero the diagonal
-    3) Spectral radius of P (No BEARS works in log-space; this is a close surrogate)
-
-    logits: [B, D, D]
-    returns: [B] penalty (>=0)
+    """Compute acyclicity penalty in log-space like AVICI (No BEARS).
+    
+    Uses log-probabilities for numerical stability, matching AVICI's implementation.
+    
+    Args:
+        logits: [B, D, D] edge logits
+        iters: number of power iterations
+    
+    Returns:
+        [B] spectral radius estimate
     """
-    P = torch.sigmoid(logits)
-    _, D, _ = P.shape
-    diag_mask = torch.eye(D, device=P.device, dtype=torch.bool)
-    P = P.masked_fill(diag_mask.unsqueeze(0), 0.0)
-    rho = spectral_radius_power_iteration(P, iters)
-    return rho
+    B, D, _ = logits.shape
+    
+    # Convert to log-probabilities and mask diagonal
+    logp = F.logsigmoid(logits)  # [B, D, D]
+    diag_mask = torch.eye(D, device=logits.device, dtype=torch.bool)
+    logp = logp.masked_fill(diag_mask.unsqueeze(0), -float('inf'))
+    
+    # Initialize random vectors for power iteration
+    u = torch.randn(B, D, device=logits.device, dtype=logits.dtype)
+    v = torch.randn(B, D, device=logits.device, dtype=logits.dtype)
+    
+    for _ in range(iters):
+        # u_new = u @ exp(logp)
+        u_new = exp_matmul(logp, u, axis=-1)
+        # v_new = exp(logp) @ v
+        v_new = exp_matmul(logp, v, axis=-2)
+        
+        # Normalize
+        u = u_new / (u_new.norm(dim=-1, keepdim=True) + 1e-12)
+        v = v_new / (v_new.norm(dim=-1, keepdim=True) + 1e-12)
+    
+    # Stop gradient on eigenvectors
+    u = u.detach()
+    v = v.detach()
+    
+    # Rayleigh quotient: (u @ exp(logp) @ v) / (u @ v)
+    numerator = (u * exp_matmul(logp, v, axis=-2)).sum(dim=-1)
+    denominator = (u * v).sum(dim=-1).clamp(min=1e-12)
+    
+    return numerator / denominator
 
 
 # ----------------------------
@@ -488,21 +531,19 @@ def compute_f1_score(y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, float]
 # ----------------------------
 
 def train_demo(cfg: DemoConfig) -> dict[str, float]:
-    set_seed(0)
-
     # 1) Data - Generate observational + interventional data
-    A = sample_dag(cfg.n_vars, cfg.edge_prob, seed=0)
+    A = sample_dag(cfg.n_vars, cfg.edge_prob, seed=None)
     
     # AVICI LINEAR: heterogeneous noise scale per variable, uniform(0.2, 2.0)
-    rng_noise = np.random.default_rng(seed=1)
+    rng_noise = np.random.default_rng(seed=None)
     noise_scales = rng_noise.uniform(low=0.2, high=2.0, size=cfg.n_vars).astype(np.float32)
     
-    _, W = sample_linear_sem(A, cfg.n_obs, noise_scales, seed=2)
+    _, W = sample_linear_sem(A, cfg.n_obs, noise_scales, seed=None)
     # Ground-truth adjacency (binary)
     G = (np.abs(W) > 1e-8).astype(np.float32)
     
     # Sample interventional data
-    rng = np.random.default_rng(seed=3)
+    rng = np.random.default_rng(seed=None)
     interv_vars = sorted(rng.choice(cfg.n_vars, size=cfg.n_interv_vars, replace=False).tolist())
     print(f"Intervening on variables: {interv_vars}")
     
@@ -512,7 +553,7 @@ def train_demo(cfg: DemoConfig) -> dict[str, float]:
         n_interv=cfg.n_interv_obs // cfg.n_interv_vars,  # samples per intervention
         interv_vars=interv_vars,
         noise_scales=noise_scales,
-        seed=4
+        seed=None
     )
     
     print(f"Data shape: {X_np.shape}, Intervention mask shape: {interv_mask.shape}")
@@ -535,6 +576,9 @@ def train_demo(cfg: DemoConfig) -> dict[str, float]:
     X_np = X_np.astype(np.float32)
     interv_mask = interv_mask.astype(np.float32)
     G_t = torch.as_tensor(G, device=cfg.device, dtype=torch.float32).unsqueeze(0)  # [1,D,D]
+    
+    # Initialize dual variable for dual acyclicity scheduling
+    dual = torch.tensor(0.0, device=cfg.device, dtype=torch.float32)
 
     t0 = time.time()
     # 5) Train loop (decoder only)
@@ -543,25 +587,68 @@ def train_demo(cfg: DemoConfig) -> dict[str, float]:
         # node embeddings from TabPFN backbone (now with intervention information)
         node_emb = get_node_embeddings_from_tabpfn(model, X_np, interv_mask)  # [1,n_vars,E]
         logits = decoder(node_emb)  # [1,n_vars,n_vars]
-        # BCE with logits on off-diagonals
+        
+        # AVICI-style BCE with label smoothing and positive weighting
         diag_mask = torch.eye(logits.size(-1), device=logits.device, dtype=torch.bool)
-        bce = F.binary_cross_entropy_with_logits(logits[~diag_mask.unsqueeze(0)], G_t[~diag_mask.unsqueeze(0)])
-        # Acyclicity penalty
-        acyc = acyclicity_penalty_from_logits(logits, iters=cfg.power_iters).mean()
-        loss = bce + cfg.acyclicity_weight * acyc
+        n_vars = logits.size(-1)
+        
+        # Apply label smoothing to targets
+        y_soft = (1 - cfg.label_smoothing) * G_t + cfg.label_smoothing / 2.0
+        
+        # Compute log probabilities
+        logp1 = F.logsigmoid(logits)
+        logp0 = F.logsigmoid(-logits)
+        
+        # Binary cross-entropy with positive weighting
+        xent_eltwise = -(cfg.pos_weight * y_soft * logp1 + (1 - y_soft) * logp0)
+        
+        # Mask diagonal and normalize by number of edges (AVICI style)
+        xent_masked = xent_eltwise.masked_fill(diag_mask.unsqueeze(0), 0.0)
+        bce = xent_masked.sum() / (n_vars * (n_vars - 1))
+        
+        # Acyclicity penalty in log-space (AVICI style)
+        acyc_penalty = acyclicity_penalty_from_logits(logits, iters=cfg.power_iters).mean()
+        
+        # Adaptive acyclicity weight scheduling (matching AVICI)
+        if cfg.acyclicity_schedule == "const":
+            acyc_weight = cfg.acyclicity_weight
+        elif cfg.acyclicity_schedule == "linear":
+            acyc_weight = cfg.acyclicity_weight * max(0.0, (step - cfg.acyclicity_burnin) * cfg.acyclicity_linear_rate)
+        elif cfg.acyclicity_schedule == "dual":
+            # Dual ascent (augmented Lagrangian)
+            if step >= cfg.acyclicity_warmup:
+                acyc_weight = cfg.acyclicity_weight * dual.item()
+            else:
+                acyc_weight = 0.0
+        else:
+            raise ValueError(f"Unknown acyclicity schedule: {cfg.acyclicity_schedule}")
+        
+        wgt_acyc = acyc_weight * acyc_penalty
+        loss = bce + wgt_acyc
         loss.backward()
         opt.step()
+        
+        # Update dual variable (for dual schedule) - only every inner_step iterations
+        if cfg.acyclicity_schedule == "dual" and step >= cfg.acyclicity_warmup:
+            if (step - cfg.acyclicity_warmup) % cfg.acyclicity_inner_step == 0:
+                with torch.no_grad():
+                    dual = dual + cfg.acyclicity_dual_lr * acyc_penalty
 
-        if (step + 1) % max(1, cfg.steps // 100) == 0:
+        if (step + 1) % max(1, cfg.steps // 10) == 0:
             tt = time.time()
             with torch.no_grad():
                 probs = torch.sigmoid(logits)[0]
                 # Simple progress metric: mean absolute error of probabilities at GT edges vs non-edges
                 pos_mae = (probs[G_t[0] > 0] - 1.0).abs().mean().item() if (G_t[0] > 0).any() else 0.0
                 neg_mae = (probs[G_t[0] == 0] - 0.0).abs().mean().item()
-            print(f"Step {step+1:04d} | loss={loss.item():.4f} | bce={bce.item():.4f} | acyc={acyc.item():.4f} | pos_mae={pos_mae:.3f} | neg_mae={neg_mae:.3f}")
-            print(probs[G_t[0] == 0].sort()[0][:5].cpu().numpy())
-            print(probs[G_t[0] > 0].sort()[0][:5].cpu().numpy())
+            
+            log_str = f"Step {step+1:04d} | loss={loss.item():.4f} | bce={bce.item():.4f} | acyc_raw={acyc_penalty.item():.4f} | acyc_wgt={wgt_acyc.item():.4f}"
+            if cfg.acyclicity_schedule == "dual":
+                log_str += f" | dual={dual.item():.4f}"
+            log_str += f" | pos_mae={pos_mae:.3f} | neg_mae={neg_mae:.3f}"
+            print(log_str)
+            print(f"  Non-edge probs (max 5): {probs[G_t[0] == 0].sort()[0][-5:].cpu().numpy()}")
+            print(f"  Edge probs (min 5):     {probs[G_t[0] > 0].sort()[0][:5].cpu().numpy()}")
             print(f"  Time for {max(1, cfg.steps // 100)} steps: {tt - t0:.2f} sec")
             t0 = time.time()
 
@@ -577,6 +664,9 @@ def train_demo(cfg: DemoConfig) -> dict[str, float]:
         # Compute F1 score
         metrics = compute_f1_score(G, G_pred)
         metrics['sid'] = SID(G, G_pred)
+
+        print(G)
+        print(G_pred)
         
         return metrics
 
@@ -590,6 +680,16 @@ def run_benchmark(cfg: DemoConfig) -> None:
     print(f"  - Interventional: {cfg.n_interv_obs} (on {cfg.n_interv_vars} variables)")
     print(f"  - Decision threshold: {cfg.decision_threshold}")
     print(f"  - Test instances: {cfg.n_test_instances}")
+    print(f"\nLoss Configuration (matching AVICI):")
+    print(f"  - Label smoothing: {cfg.label_smoothing}")
+    print(f"  - Positive weight: {cfg.pos_weight}")
+    print(f"  - Acyclicity schedule: {cfg.acyclicity_schedule}")
+    print(f"  - Acyclicity weight: {cfg.acyclicity_weight}")
+    if cfg.acyclicity_schedule == "linear":
+        print(f"  - Linear rate: {cfg.acyclicity_linear_rate}, burnin: {cfg.acyclicity_burnin}")
+    elif cfg.acyclicity_schedule == "dual":
+        print(f"  - Dual lr: {cfg.acyclicity_dual_lr}, inner_step: {cfg.acyclicity_inner_step}, warmup: {cfg.acyclicity_warmup}")
+    print(f"  - Power iterations: {cfg.power_iters} (log-space)")
     print("=" * 80)
     
     all_metrics = []
@@ -599,8 +699,8 @@ def run_benchmark(cfg: DemoConfig) -> None:
         print(f"Test Instance {instance + 1}/{cfg.n_test_instances}")
         print(f"{'='*80}")
         
-        # Use different seed for each instance
-        set_seed(instance * 100)
+        # # Use different seed for each instance
+        # set_seed(instance * 100)
         
         metrics = train_demo(cfg)
         all_metrics.append(metrics)
