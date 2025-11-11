@@ -227,7 +227,6 @@ class CausalGraphDataset(Dataset):
             
             # If we've gone through all cached graphs, reshuffle
             if self.current_cache_pos >= len(self.graphs):
-                print(f"✓ Completed pass through cache. Reshuffling {len(self.graphs)} graphs.")
                 self._shuffle_cache()
             
             return graph
