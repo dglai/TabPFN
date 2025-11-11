@@ -9,6 +9,7 @@ import torch.nn.functional as F
 from torch import optim
 
 from cdt.metrics import SID
+import tqdm
 
 # Provide a local no-op @override decorator recognized by type checkers
 Fn = TypeVar("Fn", bound=Callable[..., Any])
@@ -61,21 +62,34 @@ class Hyperparameters:
     nhead: int = 8
     nlayers: int = 4
     # Train (matching AVICI defaults)
-    lr: float = 2e-4  # AVICI default learning rate
+    lr: float = 3e-5  # AVICI LINEAR base learning rate
     weight_decay: float = 0.0  # AVICI default (LAMB optimizer handles weight decay)
-    steps: int = 10000
+    steps: int = 100000  # Increased to 100k (AVICI uses 300k, but 100k for faster testing)
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
+    # Optimizer (matching AVICI defaults)
+    grad_clip: float = 1.0  # AVICI default: clip gradients at 1.0
+    lr_schedule: str = "piecewise"  # AVICI default: piecewise_const_200k_300k
+    lr_drop_steps: Optional[list[int]] = None  # Will be set to [70000] for 100k training
+    lr_drop_factor: float = 0.1  # AVICI default: multiply by 0.1 at each drop
+    polyak_step_size: float = 0.001  # AVICI default: EMA rate for parameter averaging
     # Causal loss (matching AVICI defaults)
     label_smoothing: float = 0.0  # AVICI default: no label smoothing
     pos_weight: float = 1.0  # AVICI default: no positive class weighting
     acyclicity_weight: float = 1.0  # AVICI default base weight
     acyclicity_schedule: str = "dual"  # AVICI default: dual ascent (augmented Lagrangian)
-    acyclicity_burnin: int = 50000  # AVICI default burnin (for linear schedule)
+    acyclicity_burnin: int = 50000  # AVICI default burnin
     acyclicity_linear_rate: float = 1.0  # AVICI default linear rate
-    acyclicity_dual_lr: float = 1e-4  # AVICI default: 1e-4 (not 0.01!)
+    acyclicity_dual_lr: float = 1e-4  # AVICI default: 1e-4
     acyclicity_inner_step: int = 500  # AVICI default: update dual every 500 steps
-    acyclicity_warmup: int = 1000  # warmup steps for dual schedule
+    acyclicity_warmup: bool = True  # AVICI default: warmup dual_lr gradually
+    acyclicity_polyak: float = 1e-4  # AVICI default: Polyak averaging rate for penalty
     power_iters: int = 10  # AVICI default: 10 power iterations
+    
+    def __post_init__(self):
+        # Set default LR drop steps if not provided
+        if self.lr_drop_steps is None:
+            # For 100k training, drop at 70k (AVICI drops at 200k, 300k for 300k training)
+            self.lr_drop_steps = [70000]
 
 
 def init_wandb(cfg: DemoConfig, h: Hyperparameters):
@@ -283,25 +297,34 @@ def exp_matmul(logmat: torch.Tensor, vec: torch.Tensor, axis: int) -> torch.Tens
     
     Matches AVICI's exp_matmul for numerical stability in acyclicity computation.
     
+    AVICI uses JAX's logsumexp(a, b=weights) which computes: log(sum(weights * exp(a)))
+    PyTorch doesn't have the b parameter, so we implement it as: logsumexp(a + log(weights))
+    
     Args:
         logmat: [B, D, D] log-probabilities
-        vec: [B, D] vector
-        axis: -1 for right multiply (vec @ exp(logmat)), -2 for left multiply (exp(logmat) @ vec)
+        vec: [B, D] vector (in NORMAL space, not log-space)
+        axis: -1 for left multiply (exp(logmat) @ vec), -2 for right multiply (vec @ exp(logmat))
+              This matches AVICI's convention!
     
     Returns:
         [B, D] result of multiplication
     """
+    # Convert vec to log-space for weighted logsumexp
+    log_vec = torch.log(vec.clamp(min=1e-45))  # Clamp to avoid log(0)
+    
     if axis == -1:
-        # vec @ exp(logmat): sum over second-to-last dimension
-        # logmat: [B, D, D], vec: [B, D] -> [B, D, 1] @ [B, D, D] -> [B, D, D] -> sum -> [B, D]
-        weighted = logmat + vec.unsqueeze(-1)  # [B, D, D]
-        result = torch.logsumexp(weighted, dim=-2)  # [B, D]
+        # exp(logmat) @ vec: sum over last dimension
+        # result[i] = sum_j vec[j] * exp(logmat[i,j])
+        # In log-space: log(result[i]) = logsumexp_j(log(vec[j]) + logmat[i,j])
+        weighted = logmat + log_vec.unsqueeze(-2)  # [B, D, D]
+        result = torch.logsumexp(weighted, dim=-1)  # [B, D]
         return torch.exp(result)
     elif axis == -2:
-        # exp(logmat) @ vec: sum over last dimension
-        # logmat: [B, D, D], vec: [B, D] -> [B, D, D] @ [B, D, 1] -> [B, D, D] -> sum -> [B, D]
-        weighted = logmat + vec.unsqueeze(-2)  # [B, D, D]
-        result = torch.logsumexp(weighted, dim=-1)  # [B, D]
+        # vec @ exp(logmat): sum over second-to-last dimension  
+        # result[j] = sum_i vec[i] * exp(logmat[i,j])
+        # In log-space: log(result[j]) = logsumexp_i(log(vec[i]) + logmat[i,j])
+        weighted = logmat + log_vec.unsqueeze(-1)  # [B, D, D]
+        result = torch.logsumexp(weighted, dim=-2)  # [B, D]
         return torch.exp(result)
     else:
         raise ValueError(f"Invalid axis {axis}")
@@ -326,15 +349,15 @@ def acyclicity_penalty_from_logits(logits: torch.Tensor, iters: int = 10) -> tor
     diag_mask = torch.eye(D, device=logits.device, dtype=torch.bool)
     logp = logp.masked_fill(diag_mask.unsqueeze(0), -float('inf'))
     
-    # Initialize random vectors for power iteration
-    u = torch.randn(B, D, device=logits.device, dtype=logits.dtype)
-    v = torch.randn(B, D, device=logits.device, dtype=logits.dtype)
+    # Initialize random positive vectors for power iteration
+    u = torch.rand(B, D, device=logits.device, dtype=logits.dtype)
+    v = torch.rand(B, D, device=logits.device, dtype=logits.dtype)
     
     for _ in range(iters):
-        # u_new = u @ exp(logp)
-        u_new = exp_matmul(logp, u, axis=-1)
-        # v_new = exp(logp) @ v
-        v_new = exp_matmul(logp, v, axis=-2)
+        # u_new = u @ exp(logp)  (right multiply)
+        u_new = exp_matmul(logp, u, axis=-2)
+        # v_new = exp(logp) @ v  (left multiply)
+        v_new = exp_matmul(logp, v, axis=-1)
         
         # Normalize
         u = u_new / (u_new.norm(dim=-1, keepdim=True) + 1e-12)
@@ -345,7 +368,8 @@ def acyclicity_penalty_from_logits(logits: torch.Tensor, iters: int = 10) -> tor
     v = v.detach()
     
     # Rayleigh quotient: (u @ exp(logp) @ v) / (u @ v)
-    numerator = (u * exp_matmul(logp, v, axis=-2)).sum(dim=-1)
+    # exp(logp) @ v is left multiply (axis=-1)
+    numerator = (u * exp_matmul(logp, v, axis=-1)).sum(dim=-1)
     denominator = (u * v).sum(dim=-1).clamp(min=1e-12)
     
     return numerator / denominator
@@ -601,17 +625,28 @@ def train_demo(cfg: DemoConfig, h: Hyperparameters) -> dict[str, float]:
     emb_dim = int(getattr(model, "ninp", h.emsize))
     decoder = CausalGraphDecoder(emb_dim).to(h.device)
     opt = optim.AdamW(decoder.parameters(), lr=h.lr, weight_decay=h.weight_decay)
+    
+    # Learning rate scheduler (AVICI uses piecewise constant)
+    if h.lr_schedule == "piecewise" and h.lr_drop_steps:
+        # Create milestones dict for MultiStepLR
+        scheduler = optim.lr_scheduler.MultiStepLR(opt, milestones=h.lr_drop_steps, gamma=h.lr_drop_factor)
+    else:
+        scheduler = None
+    
+    # Initialize Polyak-averaged parameters (EMA)
+    ave_params = {name: param.clone().detach() for name, param in decoder.named_parameters()}
 
     # 4) Prepare tensors
     X_np = X_np.astype(np.float32)
     interv_mask = interv_mask.astype(np.float32)
     G_t = torch.as_tensor(G, device=h.device, dtype=torch.float32).unsqueeze(0)  # [1,D,D]
     
-    # Initialize dual variable for dual acyclicity scheduling
+    # Initialize dual variable and Polyak-averaged penalty for dual acyclicity scheduling
     dual = torch.tensor(0.0, device=h.device, dtype=torch.float32)
+    dual_penalty_polyak = torch.tensor(0.0, device=h.device, dtype=torch.float32)
 
     # 5) Train loop (decoder only)
-    for step in range(h.steps):
+    for step in tqdm.trange(h.steps):
         opt.zero_grad(set_to_none=True)
         # node embeddings from TabPFN backbone (now with intervention information)
         node_emb = get_node_embeddings_from_tabpfn(model, X_np, interv_mask)  # [1,n_vars,E]
@@ -644,24 +679,50 @@ def train_demo(cfg: DemoConfig, h: Hyperparameters) -> dict[str, float]:
         elif h.acyclicity_schedule == "linear":
             acyc_weight = h.acyclicity_weight * max(0.0, (step - h.acyclicity_burnin) * h.acyclicity_linear_rate)
         elif h.acyclicity_schedule == "dual":
-            # Dual ascent (augmented Lagrangian)
-            if step >= h.acyclicity_warmup:
-                acyc_weight = h.acyclicity_weight * dual.item()
-            else:
-                acyc_weight = 0.0
+            # Dual ascent (augmented Lagrangian) - AVICI style
+            acyc_weight = h.acyclicity_weight * dual.item()
         else:
             raise ValueError(f"Unknown acyclicity schedule: {h.acyclicity_schedule}")
         
         wgt_acyc = acyc_weight * acyc_penalty
         loss = bce + wgt_acyc
         loss.backward()
+        
+        # Gradient clipping (AVICI default)
+        if h.grad_clip > 0:
+            torch.nn.utils.clip_grad_norm_(decoder.parameters(), h.grad_clip)
+        
         opt.step()
         
-        # Update dual variable (for dual schedule) - only every inner_step iterations
-        if h.acyclicity_schedule == "dual" and step >= h.acyclicity_warmup:
-            if (step - h.acyclicity_warmup) % h.acyclicity_inner_step == 0:
-                with torch.no_grad():
-                    dual = dual + h.acyclicity_dual_lr * acyc_penalty
+        # Update Polyak-averaged parameters (EMA) - AVICI style
+        with torch.no_grad():
+            for name, param in decoder.named_parameters():
+                ave_params[name].mul_(1 - h.polyak_step_size).add_(param, alpha=h.polyak_step_size)
+        
+        # Update dual variable (for dual schedule) - AVICI style
+        if h.acyclicity_schedule == "dual":
+            with torch.no_grad():
+                # Polyak averaging of acyclicity penalty (AVICI uses this for stability)
+                if step == 0:
+                    dual_penalty_polyak = acyc_penalty.clone()
+                else:
+                    dual_penalty_polyak = (1 - h.acyclicity_polyak) * dual_penalty_polyak + h.acyclicity_polyak * acyc_penalty
+                
+                # Dual learning rate with warmup (AVICI gradually increases dual_lr)
+                if h.acyclicity_warmup:
+                    dual_lr = min(h.acyclicity_dual_lr, step * h.acyclicity_dual_lr / h.acyclicity_burnin)
+                    effective_burnin = 0  # warmup replaces burnin
+                else:
+                    dual_lr = h.acyclicity_dual_lr
+                    effective_burnin = h.acyclicity_burnin
+                
+                # Update dual every inner_step iterations after burnin
+                if (step % h.acyclicity_inner_step == 0) and (step > effective_burnin):
+                    dual = dual + dual_lr * dual_penalty_polyak
+        
+        # Learning rate schedule step
+        if scheduler is not None:
+            scheduler.step()
 
         # Log to wandb every step (no console logging)
         if WB_RUN is not None:
@@ -677,18 +738,53 @@ def train_demo(cfg: DemoConfig, h: Hyperparameters) -> dict[str, float]:
                 "acyclicity/weighted": float(wgt_acyc.item()),
                 "metrics/pos_mae": float(pos_mae),
                 "metrics/neg_mae": float(neg_mae),
-                "hp/lr": float(h.lr),
+                "hp/lr": float(opt.param_groups[0]['lr']),  # Log actual LR (accounts for schedule)
                 "hp/weight_decay": float(h.weight_decay),
                 "step": int(WB_BASE_STEP_OFFSET + step + 1),
             }
             if h.acyclicity_schedule == "dual":
                 log_payload["acyclicity/dual"] = float(dual.item())
+                log_payload["acyclicity/dual_penalty_polyak"] = float(dual_penalty_polyak.item())
+                if h.acyclicity_warmup:
+                    current_dual_lr = min(h.acyclicity_dual_lr, step * h.acyclicity_dual_lr / h.acyclicity_burnin)
+                    log_payload["acyclicity/dual_lr"] = float(current_dual_lr)
+            
+            # Log adjacency matrices every 1000 steps
+            if (step + 1) % 1000 == 0:
+                with torch.no_grad():
+                    probs_np = probs.cpu().numpy()
+                    G_pred_binary = (probs_np > cfg.decision_threshold).astype(np.float32)
+                    
+                    # Log matrices directly as wandb Images
+                    # wandb.Image accepts numpy arrays and will render them as heatmaps
+                    log_payload["adjacency/ground_truth"] = wandb.Image(
+                        G,
+                        caption=f"Ground Truth (Step {step + 1})"
+                    )
+                    log_payload["adjacency/predicted_probs"] = wandb.Image(
+                        probs_np,
+                        caption=f"Predicted Probabilities (Step {step + 1})"
+                    )
+                    log_payload["adjacency/predicted_binary"] = wandb.Image(
+                        G_pred_binary,
+                        caption=f"Predicted Binary (threshold={cfg.decision_threshold}, Step {step + 1})"
+                    )
+            
             cast(Any, WB_RUN).log(log_payload, step=WB_BASE_STEP_OFFSET + step + 1)
-    # 6) Final evaluation
+    # 6) Final evaluation (use Polyak-averaged parameters for better stability)
     with torch.no_grad():
+        # Temporarily load Polyak-averaged parameters
+        original_params = {name: param.clone() for name, param in decoder.named_parameters()}
+        for name, param in decoder.named_parameters():
+            param.data.copy_(ave_params[name])
+        
         node_emb = get_node_embeddings_from_tabpfn(model, X_np, interv_mask)
         logits = decoder(node_emb)
         probs = torch.sigmoid(logits)[0].cpu().numpy()
+        
+        # Restore original parameters
+        for name, param in decoder.named_parameters():
+            param.data.copy_(original_params[name])
         
         # Convert probabilities to binary predictions using threshold
         G_pred = (probs > cfg.decision_threshold).astype(np.float32)
