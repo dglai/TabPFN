@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import optim
+from torch.utils.data import Dataset, DataLoader
 
 from cdt.metrics import SID
 import tqdm
@@ -66,6 +67,9 @@ class Hyperparameters:
     weight_decay: float = 0.0  # AVICI default (LAMB optimizer handles weight decay)
     steps: int = 100000  # Increased to 100k (AVICI uses 300k, but 100k for faster testing)
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
+    batch_size: int = 8  # Number of graphs per batch
+    # DataLoader configuration (cache-on-the-fly mode)
+    num_batches: Optional[int] = None  # Max batches to cache (None = infinite, never caches)
     # Optimizer (matching AVICI defaults)
     grad_clip: float = 1.0  # AVICI default: clip gradients at 1.0
     lr_schedule: str = "piecewise"  # AVICI default: piecewise_const_200k_300k
@@ -92,8 +96,176 @@ class Hyperparameters:
             self.lr_drop_steps = [70000]
 
 
+# ----------------------------
+# Causal Graph Dataset (PyTorch)
+# ----------------------------
+
+class CausalGraphDataset(Dataset):
+    """PyTorch Dataset for generating causal graphs with interventional data.
+    
+    Supports two modes:
+    1. Fixed size: Pre-generates a fixed number of graphs
+    2. Infinite: Generates graphs on-the-fly (for online training)
+    """
+    
+    def __init__(
+        self,
+        cfg: DemoConfig,
+        num_graphs: Optional[int] = None,
+    ):
+        super().__init__()
+        """Initialize the Dataset.
+        
+        Args:
+            cfg: Demo configuration
+            num_graphs: Maximum number of graphs to cache. If None, generates infinitely without caching.
+        """
+        self.cfg = cfg
+        self.num_graphs = num_graphs
+        
+        # Start with empty cache (will fill on-the-fly if num_graphs is set)
+        self.graphs: list[dict[str, np.ndarray]] = []
+        self.is_cache_full = False
+        self.cache_indices: list[int] = []  # Shuffled indices for cache access
+        self.current_cache_pos = 0  # Current position in shuffled cache
+    
+    def _generate_single_graph(self) -> dict[str, np.ndarray]:
+        """Generate a single graph with data.
+        
+        Returns:
+            Dictionary with keys: 'A', 'G', 'X', 'interv_mask'
+        """
+        A = sample_dag(self.cfg.n_vars, self.cfg.edge_prob, seed=None)
+        
+        # AVICI LINEAR: heterogeneous noise scale per variable
+        rng_noise = np.random.default_rng(seed=None)
+        noise_scales = rng_noise.uniform(low=0.2, high=2.0, size=self.cfg.n_vars).astype(np.float32)
+        
+        _, W = sample_linear_sem(A, self.cfg.n_obs, noise_scales, seed=None)
+        G = (np.abs(W) > 1e-8).astype(np.float32)
+        
+        # Sample interventional data
+        rng = np.random.default_rng(seed=None)
+        interv_vars = sorted(rng.choice(self.cfg.n_vars, size=self.cfg.n_interv_vars, replace=False).tolist())
+        
+        X_np, interv_mask = sample_interventional_data(
+            A, W,
+            n_obs=self.cfg.n_obs - self.cfg.n_interv_obs,
+            n_interv=self.cfg.n_interv_obs // self.cfg.n_interv_vars,
+            interv_vars=interv_vars,
+            noise_scales=noise_scales,
+            seed=None
+        )
+        
+        return {
+            'A': A,
+            'G': G,
+            'X': X_np,
+            'interv_mask': interv_mask,
+        }
+    
+    @override
+    def __len__(self) -> int:
+        """Return dataset size."""
+        if self.num_graphs is not None:
+            return self.num_graphs
+        else:
+            # For online generation, return a large number
+            return h.steps  # Effectively infinite
+    
+    def _shuffle_cache(self) -> None:
+        """Shuffle the cache indices for random access."""
+        self.cache_indices = list(range(len(self.graphs)))
+        random.shuffle(self.cache_indices)
+        self.current_cache_pos = 0
+    
+    @override
+    def __getitem__(self, idx: int) -> dict[str, np.ndarray]:
+        """Get a single graph.
+        
+        Cache-on-the-fly behavior with shuffling:
+        - If num_graphs is None: Always generates new graphs (infinite, no caching)
+        - If num_graphs is set and cache not full: Generate and cache new graph
+        - If cache is full: Return from shuffled cache, reshuffle when all graphs are used
+        
+        Args:
+            idx: Index (used for building cache, ignored when looping over shuffled cache)
+            
+        Returns:
+            Dictionary with keys: 'A', 'G', 'X', 'interv_mask'
+        """
+        if self.num_graphs is None:
+            # Infinite mode: always generate new graphs, never cache
+            return self._generate_single_graph()
+        
+        # Cache-on-the-fly mode (num_graphs is set)
+        if not self.is_cache_full:
+            # Still building cache
+            if idx < len(self.graphs):
+                # Already cached
+                return self.graphs[idx]
+            else:
+                # Generate new graph and cache it
+                graph = self._generate_single_graph()
+                self.graphs.append(graph)
+                
+                # Check if cache is now full
+                if len(self.graphs) >= self.num_graphs:
+                    self.is_cache_full = True
+                    print(f"✓ Cache full: {len(self.graphs)} graphs cached. Shuffling and looping over cached data.")
+                    self._shuffle_cache()  # Initial shuffle
+                
+                return graph
+        else:
+            # Cache is full, use shuffled indices
+            # Get current graph from shuffled cache
+            cache_idx = self.cache_indices[self.current_cache_pos]
+            graph = self.graphs[cache_idx]
+            
+            # Move to next position
+            self.current_cache_pos += 1
+            
+            # If we've gone through all cached graphs, reshuffle
+            if self.current_cache_pos >= len(self.graphs):
+                print(f"✓ Completed pass through cache. Reshuffling {len(self.graphs)} graphs.")
+                self._shuffle_cache()
+            
+            return graph
+
+
+def collate_causal_graphs(batch: list[dict[str, np.ndarray]]) -> dict[str, Any]:
+    """Collate function for CausalGraphDataset.
+    
+    Converts a list of individual graphs into a batched format.
+    
+    Args:
+        batch: List of graph dictionaries
+        
+    Returns:
+        Batched dictionary with:
+            - 'A': list of adjacency matrices
+            - 'G': stacked binary adjacency [batch_size, n_vars, n_vars]
+            - 'X': list of data matrices
+            - 'interv_mask': list of intervention masks
+    """
+    batch_A = [item['A'] for item in batch]
+    batch_G = np.stack([item['G'] for item in batch], axis=0)
+    batch_X = [item['X'] for item in batch]
+    batch_interv_mask = [item['interv_mask'] for item in batch]
+    
+    return {
+        'A': batch_A,
+        'G': batch_G,
+        'X': batch_X,
+        'interv_mask': batch_interv_mask,
+    }
+
+
 def init_wandb(cfg: DemoConfig, h: Hyperparameters):
-    """Initialize a Weights & Biases run (always enabled) and store it globally."""
+    """Initialize a Weights & Biases run (always enabled) and store it globally.
+    
+    For WandB sweeps, this will automatically use sweep configuration.
+    """
     global WB_RUN
     WB_RUN = wandb.init(
         project=cfg.wandb_project,
@@ -105,6 +277,16 @@ def init_wandb(cfg: DemoConfig, h: Hyperparameters):
             "hparams": asdict(h),
         },
     )
+    
+    # For WandB sweeps: Update hyperparameters from wandb.config
+    # This allows sweep to override default values
+    if WB_RUN is not None and hasattr(wandb.config, 'keys'):
+        # Update hyperparameters from sweep config
+        for key in wandb.config.keys():
+            if hasattr(h, key):
+                setattr(h, key, wandb.config[key])
+            elif hasattr(cfg, key):
+                setattr(cfg, key, wandb.config[key])
 
 
 # ----------------------------
@@ -530,6 +712,111 @@ def get_node_embeddings_from_tabpfn(
     return node_emb
 
 
+def get_node_embeddings_from_tabpfn_batched(
+    model: Any,
+    batch_X: list[np.ndarray],
+    batch_interv_mask: list[np.ndarray]
+) -> torch.Tensor:
+    """Compute per-variable embeddings for a batch of graphs using TabPFN's batch dimension.
+    
+    This is more efficient than processing graphs sequentially as it uses TabPFN's
+    native batch processing capability.
+    
+    Args:
+        model: TabPFN model (features_per_group=2 from checkpoint)
+        batch_X: list of [S, n_vars] - variable values for each graph
+        batch_interv_mask: list of [S, n_vars] - intervention indicators for each graph
+    
+    Returns:
+        node_emb: [batch_size, n_vars, E] - embeddings for all graphs
+    """
+    import einops  # local import
+    
+    batch_size = len(batch_X)
+    device = next(model.parameters()).device
+    dtype = next(model.parameters()).dtype
+    
+    # Prepare interleaved data for all graphs
+    batch_X_interleaved = []
+    for X_np, interv_mask in zip(batch_X, batch_interv_mask):
+        X_interleaved = prepare_data_with_interventions(X_np, interv_mask)
+        batch_X_interleaved.append(X_interleaved)
+    
+    # All graphs should have same shape
+    S, D_orig = batch_X_interleaved[0].shape
+    # D_orig = n_vars * 2 (interleaved format)
+    
+    # Stack into TabPFN's batch format: [S, batch_size, D]
+    x_main = torch.stack([
+        torch.as_tensor(X_int, device=device, dtype=dtype) 
+        for X_int in batch_X_interleaved
+    ], dim=1)  # [S, batch_size, D]
+    
+    # y: dummy zeros for encoder
+    y_main = torch.zeros(S, batch_size, 1, device=device, dtype=dtype)  # [S, batch_size, 1]
+    
+    # Padding to multiple of features_per_group
+    fpg = int(model.features_per_group)  # This is 2 from checkpoint
+    D = D_orig
+    missing = (fpg - (D % fpg)) % fpg
+    if missing > 0:
+        pad = torch.zeros(S, batch_size, missing, device=device, dtype=dtype)
+        x_main = torch.cat([x_main, pad], dim=-1)
+        D = D + missing
+    
+    # Rearrange to groups: [B, S, F, n]
+    # With fpg=2 and D=n_vars*2, F = n_vars
+    x_b_s_f_n = x_main.permute(1, 0, 2).contiguous()  # [batch_size, S, D]
+    F = D // fpg  # F = n_vars
+    x_b_s_f_n = x_b_s_f_n.view(batch_size, S, F, int(fpg))
+    
+    # Encode X: SequentialEncoder expects dict and flattened (s, b*f, n)
+    x_dict = {"main": x_b_s_f_n}
+    x_flat = {k: einops.rearrange(v, "b s f n -> s (b f) n") for k, v in x_dict.items()}
+    embedded_x = model.encoder(
+        x_flat,
+        single_eval_pos=S,
+        cache_trainset_representation=True,
+    )  # [s, batch_size*f, e]
+    embedded_x = einops.rearrange(embedded_x, "s (b f) e -> b s f e", b=batch_size)  # [batch_size, S, F, E]
+    
+    # Encode y (dummy zeros)
+    y_dict = {"main": y_main}
+    embedded_y = model.y_encoder(
+        y_dict,
+        single_eval_pos=S,
+        cache_trainset_representation=True,
+    ).transpose(0, 1)  # [batch_size, S, E]
+    
+    # Add embeddings (positional, DAG if configured)
+    embedded_x, embedded_y = model.add_embeddings(
+        embedded_x,
+        embedded_y,
+        data_dags=None,
+        num_features=D,
+        seq_len=S,
+        cache_embeddings=True,
+        use_cached_embeddings=False,
+    )
+    
+    # Concatenate feature tokens with target token
+    embedded_input = torch.cat([embedded_x, embedded_y.unsqueeze(2)], dim=2)  # [batch_size, S, F+1, E]
+    
+    # Run transformer encoder
+    enc_out = model.transformer_encoder(
+        embedded_input,
+        single_eval_pos=S,
+        cache_trainset_representation=True,
+    )  # [batch_size, S, F+1, E]
+    
+    # Extract feature tokens and pool across S (AVICI uses max over observations)
+    feature_tokens = enc_out[:, :, :-1, :]  # [batch_size, S, F, E] where F=n_vars
+    node_emb = feature_tokens.max(dim=1).values  # [batch_size, n_vars, E]
+    
+    # Now node_emb[b, i, :] is the embedding for variable i in graph b
+    return node_emb
+
+
 # ----------------------------
 # Evaluation metrics
 # ----------------------------
@@ -586,32 +873,22 @@ def compute_f1_score(y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, float]
 # ----------------------------
 
 def train_demo(cfg: DemoConfig, h: Hyperparameters) -> dict[str, float]:
-    # 1) Data - Generate observational + interventional data
-    A = sample_dag(cfg.n_vars, cfg.edge_prob, seed=None)
+    # 1) Create PyTorch Dataset (always cache-on-the-fly)
+    num_graphs = h.num_batches * h.batch_size if h.num_batches is not None else None
+    dataset = CausalGraphDataset(cfg, num_graphs=num_graphs)
     
-    # AVICI LINEAR: heterogeneous noise scale per variable, uniform(0.2, 2.0)
-    rng_noise = np.random.default_rng(seed=None)
-    noise_scales = rng_noise.uniform(low=0.2, high=2.0, size=cfg.n_vars).astype(np.float32)
-    
-    _, W = sample_linear_sem(A, cfg.n_obs, noise_scales, seed=None)
-    # Ground-truth adjacency (binary)
-    G = (np.abs(W) > 1e-8).astype(np.float32)
-    
-    # Sample interventional data
-    rng = np.random.default_rng(seed=None)
-    interv_vars = sorted(rng.choice(cfg.n_vars, size=cfg.n_interv_vars, replace=False).tolist())
-    # No console logging
-    
-    X_np, interv_mask = sample_interventional_data(
-        A, W, 
-        n_obs=cfg.n_obs - cfg.n_interv_obs,  # adjust observational samples
-        n_interv=cfg.n_interv_obs // cfg.n_interv_vars,  # samples per intervention
-        interv_vars=interv_vars,
-        noise_scales=noise_scales,
-        seed=None
+    # Create PyTorch DataLoader
+    dataloader = DataLoader(
+        dataset,
+        batch_size=h.batch_size,
+        shuffle=False,  # Don't shuffle to maintain cache order
+        collate_fn=collate_causal_graphs,
+        num_workers=0,  # Use 0 for now (main process), can increase for parallel generation
+        pin_memory=torch.cuda.is_available(),
     )
     
-    # No console logging
+    # Create iterator
+    data_iter = iter(dataloader)
 
     # 2) Backbone
     model = build_tabpfn_backbone(cfg).to(h.device)
@@ -636,21 +913,35 @@ def train_demo(cfg: DemoConfig, h: Hyperparameters) -> dict[str, float]:
     # Initialize Polyak-averaged parameters (EMA)
     ave_params = {name: param.clone().detach() for name, param in decoder.named_parameters()}
 
-    # 4) Prepare tensors
-    X_np = X_np.astype(np.float32)
-    interv_mask = interv_mask.astype(np.float32)
-    G_t = torch.as_tensor(G, device=h.device, dtype=torch.float32).unsqueeze(0)  # [1,D,D]
-    
-    # Initialize dual variable and Polyak-averaged penalty for dual acyclicity scheduling
+    # 4) Initialize dual variable and Polyak-averaged penalty for dual acyclicity scheduling
     dual = torch.tensor(0.0, device=h.device, dtype=torch.float32)
     dual_penalty_polyak = torch.tensor(0.0, device=h.device, dtype=torch.float32)
 
-    # 5) Train loop (decoder only)
+    # 5) Train loop (decoder only) - iterate over DataLoader
     for step in tqdm.trange(h.steps):
+        # Get next batch from DataLoader
+        try:
+            batch = next(data_iter)
+        except StopIteration:
+            # For pregenerated mode, restart iterator when exhausted
+            data_iter = iter(dataloader)
+            batch = next(data_iter)
+        
+        # Extract batch data
+        batch_X = batch['X']  # list of [n_obs, n_vars]
+        batch_interv_mask = batch['interv_mask']  # list of [n_obs, n_vars]
+        G_batch = batch['G']  # [batch_size, n_vars, n_vars]
+        
+        # Prepare ground truth tensor
+        G_t = torch.as_tensor(G_batch, device=h.device, dtype=torch.float32)
+        
         opt.zero_grad(set_to_none=True)
-        # node embeddings from TabPFN backbone (now with intervention information)
-        node_emb = get_node_embeddings_from_tabpfn(model, X_np, interv_mask)  # [1,n_vars,E]
-        logits = decoder(node_emb)  # [1,n_vars,n_vars]
+        
+        # Get node embeddings for all graphs in batch (parallel processing via TabPFN's batch dim)
+        node_emb_batch = get_node_embeddings_from_tabpfn_batched(
+            model, batch_X, batch_interv_mask
+        )  # [batch_size, n_vars, E]
+        logits = decoder(node_emb_batch)  # [batch_size, n_vars, n_vars]
         
         # AVICI-style BCE with label smoothing and positive weighting
         diag_mask = torch.eye(logits.size(-1), device=logits.device, dtype=torch.bool)
@@ -668,7 +959,8 @@ def train_demo(cfg: DemoConfig, h: Hyperparameters) -> dict[str, float]:
         
         # Mask diagonal and normalize by number of edges (AVICI style)
         xent_masked = xent_eltwise.masked_fill(diag_mask.unsqueeze(0), 0.0)
-        bce = xent_masked.sum() / (n_vars * (n_vars - 1))
+        # Average over batch, sum over edges, normalize by d(d-1)
+        bce = xent_masked.sum(dim=(-2, -1)).mean() / (n_vars * (n_vars - 1))
         
         # Acyclicity penalty in log-space (AVICI style)
         acyc_penalty = acyclicity_penalty_from_logits(logits, iters=h.power_iters).mean()
@@ -727,6 +1019,7 @@ def train_demo(cfg: DemoConfig, h: Hyperparameters) -> dict[str, float]:
         # Log to wandb every step (no console logging)
         if WB_RUN is not None:
             with torch.no_grad():
+                # Use first element in batch for visualization metrics
                 probs = torch.sigmoid(logits)[0]
                 pos_mae = (probs[G_t[0] > 0] - 1.0).abs().mean().item() if (G_t[0] > 0).any() else 0.0
                 neg_mae = (probs[G_t[0] == 0] - 0.0).abs().mean().item()
@@ -749,59 +1042,88 @@ def train_demo(cfg: DemoConfig, h: Hyperparameters) -> dict[str, float]:
                     current_dual_lr = min(h.acyclicity_dual_lr, step * h.acyclicity_dual_lr / h.acyclicity_burnin)
                     log_payload["acyclicity/dual_lr"] = float(current_dual_lr)
             
-            # Log adjacency matrices every 1000 steps
+            # Log adjacency matrices every 1000 steps (first element in batch)
             if (step + 1) % 1000 == 0:
                 with torch.no_grad():
                     probs_np = probs.cpu().numpy()
                     G_pred_binary = (probs_np > cfg.decision_threshold).astype(np.float32)
                     
-                    # Log matrices directly as wandb Images
+                    # Log matrices directly as wandb Images (first element in batch)
                     # wandb.Image accepts numpy arrays and will render them as heatmaps
                     log_payload["adjacency/ground_truth"] = wandb.Image(
-                        G,
-                        caption=f"Ground Truth (Step {step + 1})"
+                        G_batch[0],  # First graph in batch
+                        caption=f"Ground Truth [0] (Step {step + 1})"
                     )
                     log_payload["adjacency/predicted_probs"] = wandb.Image(
                         probs_np,
-                        caption=f"Predicted Probabilities (Step {step + 1})"
+                        caption=f"Predicted Probabilities [0] (Step {step + 1})"
                     )
                     log_payload["adjacency/predicted_binary"] = wandb.Image(
                         G_pred_binary,
-                        caption=f"Predicted Binary (threshold={cfg.decision_threshold}, Step {step + 1})"
+                        caption=f"Predicted Binary [0] (threshold={cfg.decision_threshold}, Step {step + 1})"
                     )
             
             cast(Any, WB_RUN).log(log_payload, step=WB_BASE_STEP_OFFSET + step + 1)
+    
     # 6) Final evaluation (use Polyak-averaged parameters for better stability)
+    # Generate a fresh batch for evaluation using the dataset
+    eval_dataset = CausalGraphDataset(cfg, num_graphs=h.batch_size)
+    eval_batch_list = [eval_dataset[i] for i in range(h.batch_size)]
+    eval_batch = collate_causal_graphs(eval_batch_list)
+    eval_batch_X = eval_batch['X']
+    eval_batch_interv_mask = eval_batch['interv_mask']
+    eval_G_batch = eval_batch['G']
+    
     with torch.no_grad():
         # Temporarily load Polyak-averaged parameters
         original_params = {name: param.clone() for name, param in decoder.named_parameters()}
         for name, param in decoder.named_parameters():
             param.data.copy_(ave_params[name])
         
-        node_emb = get_node_embeddings_from_tabpfn(model, X_np, interv_mask)
-        logits = decoder(node_emb)
-        probs = torch.sigmoid(logits)[0].cpu().numpy()
+        # Get embeddings for all graphs in evaluation batch
+        node_emb_batch = get_node_embeddings_from_tabpfn_batched(
+            model, eval_batch_X, eval_batch_interv_mask
+        )  # [batch_size, n_vars, E]
+        logits = decoder(node_emb_batch)  # [batch_size, n_vars, n_vars]
+        probs_batch = torch.sigmoid(logits).cpu().numpy()  # [batch_size, n_vars, n_vars]
         
         # Restore original parameters
         for name, param in decoder.named_parameters():
             param.data.copy_(original_params[name])
         
-        # Convert probabilities to binary predictions using threshold
-        G_pred = (probs > cfg.decision_threshold).astype(np.float32)
+        # Compute metrics for each graph in batch
+        all_batch_metrics = []
+        for b in range(h.batch_size):
+            probs = probs_batch[b]
+            G_pred = (probs > cfg.decision_threshold).astype(np.float32)
+            
+            batch_metrics = compute_f1_score(eval_G_batch[b], G_pred)
+            batch_metrics['sid'] = SID(eval_G_batch[b], G_pred)
+            all_batch_metrics.append(batch_metrics)
         
-        # Compute F1 score
-        metrics = compute_f1_score(G, G_pred)
-        metrics['sid'] = SID(G, G_pred)
-
+        # Average metrics across batch
+        metrics = {
+            'precision': np.mean([m['precision'] for m in all_batch_metrics]),
+            'recall': np.mean([m['recall'] for m in all_batch_metrics]),
+            'f1': np.mean([m['f1'] for m in all_batch_metrics]),
+            'sid': np.mean([m['sid'] for m in all_batch_metrics]),
+            'tp': np.mean([m['tp'] for m in all_batch_metrics]),
+            'fp': np.mean([m['fp'] for m in all_batch_metrics]),
+            'fn': np.mean([m['fn'] for m in all_batch_metrics]),
+        }
+    
     # No console logging
         
-        # Final logging to wandb (summary)
+        # Final logging to wandb (summary - averaged over batch)
         if WB_RUN is not None:
             cast(Any, WB_RUN).log({
                 "final/precision": float(metrics['precision']),
                 "final/recall": float(metrics['recall']),
                 "final/f1": float(metrics['f1']),
                 "final/sid": float(metrics['sid']),
+                "final/tp": float(metrics['tp']),
+                "final/fp": float(metrics['fp']),
+                "final/fn": float(metrics['fn']),
             }, step=WB_BASE_STEP_OFFSET + h.steps)
     return metrics
 
@@ -849,6 +1171,10 @@ def run_benchmark(cfg: DemoConfig, h: Hyperparameters) -> None:
 
 
 if __name__ == "__main__":
+    # Default configuration
     cfg = DemoConfig()
     h = Hyperparameters()
+    
+    # Note: For WandB sweeps, hyperparameters will be updated in init_wandb()
+    # from wandb.config after wandb.init() is called
     run_benchmark(cfg, h)

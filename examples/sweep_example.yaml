@@ -1,0 +1,31 @@
+# Example WandB Sweep Configuration for AVICI Causal Decoder Demo
+# 
+# Usage:
+#   wandb sweep examples/sweep_example.yaml
+#   wandb agent <your-entity>/<your-project>/<sweep-id>
+
+program: examples/avici_causal_decoder_demo.py
+method: grid
+metric:
+  name: final/f1
+  goal: maximize
+
+parameters:
+  # Hyperparameters to sweep
+  dataloader_mode:
+    value: "pregenerated"
+
+  num_batches:
+    values: [1, 10, 100, 1000, 10000, 100000, 1000000, 10000000]
+  
+  wandb_group:
+    value: "test_scalability"
+
+# Limit total runs
+run_cap: 30
+
+# Early termination for poorly performing runs
+early_terminate:
+  type: hyperband
+  min_iter: 10000
+  eta: 2
