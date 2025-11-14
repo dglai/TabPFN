@@ -184,14 +184,14 @@ class TestExpMatmul:
         assert result_right.shape == (B, D)
 
 
-class _TestAcyclicityPenalty:
+class TestAcyclicityPenalty:
     """Test suite for acyclicity_penalty_from_logits function."""
     
     def test_acyclic_graph_low_penalty(self):
         """Test that acyclic (DAG) graphs have low spectral radius."""
         # Create a strictly upper triangular matrix (DAG)
         B, D = 1, 5
-        logits = torch.zeros(B, D, D)
+        logits = torch.full((B, D, D), -10.0)
         
         # Set upper triangular to positive values (high probability edges)
         for i in range(D):
@@ -233,7 +233,7 @@ class _TestAcyclicityPenalty:
     def test_diagonal_masked(self):
         """Test that diagonal is properly masked (no self-loops)."""
         B, D = 1, 3
-        logits = torch.zeros(B, D, D)
+        logits = torch.full((B, D, D), -10.0)
         
         # Set diagonal to high values (should be ignored)
         for i in range(D):
