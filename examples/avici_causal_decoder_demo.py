@@ -9,8 +9,9 @@ import torch.nn.functional as F
 from torch import optim
 from torch.utils.data import Dataset, DataLoader
 
-from gadjid import sid as compute_sid
+from gadjid import shd
 import pytorch_lightning as pl
+import causaldag as cd
 from pytorch_lightning.callbacks import Callback, ModelCheckpoint
 from pytorch_lightning.loggers import WandbLogger
 
@@ -35,11 +36,9 @@ def set_seed(seed: int = 0) -> None:
 @dataclass
 class DemoConfig:
     # Data - matching AVICI LINEAR test:train configuration exactly
-    n_vars: int = 6  # d=30 from paper
-    n_obs: int = 128  # n=1000 total observations (500 obs + 500 int)
-    edge_prob: float = 2 / 6  # 2 / 30 edges_per_var=2 on average for d=30
-    n_interv_obs: int = 64  # half observational, half interventional (like paper)
-    n_interv_vars: int = 2  # intervene on ALL variables (n_interv_vars: -1 in AVICI config means all)
+    n_vars: int = 30  # d=30 from paper
+    n_obs: int = 128  # n=1000 total observations (all observational now)
+    edge_prob: float = 2 / 30  # 2 / 30 edges_per_var=2 on average for d=30
     # Evaluation
     n_test_instances: int = 1  # number of test instances to average over
     decision_threshold: float = 0.5  # threshold for converting probabilities to binary predictions
@@ -69,7 +68,7 @@ class Hyperparameters:
     weight_decay: float = 0.0  # AVICI default (LAMB optimizer handles weight decay)
     steps: int = 1000000  # Increased to 100k (AVICI uses 300k, but 100k for faster testing)
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
-    batch_size: int = 48  # Number of graphs per batch
+    batch_size: int = 40  # Number of graphs per batch
     # DataLoader configuration (cache-on-the-fly mode)
     num_batches: Optional[int] = None  # Max batches to cache (None = infinite, never caches)
     # Evaluation configuration
@@ -140,38 +139,33 @@ class CausalGraphDataset(Dataset):
         self.current_cache_pos = 0  # Current position in shuffled cache
     
     def _generate_single_graph(self) -> dict[str, np.ndarray]:
-        """Generate a single graph with data.
+        """Generate a single graph with observational data only.
         
         Returns:
-            Dictionary with keys: 'A', 'G', 'X', 'interv_mask'
+            Dictionary with keys: 'A', 'G', 'X'
+            where G is now the CPDAG adjacency matrix
         """
+        # Generate DAG
         A = sample_dag(self.cfg.n_vars, self.cfg.edge_prob, seed=None)
+        
+        # Convert DAG to CPDAG for ground truth
+        dag = cd.DAG(nodes=set(range(self.cfg.n_vars)),
+                     arcs={(i, j) for i, j in zip(*np.where(A > 0))})
+        cpdag = dag.cpdag()
+        G, _ = cpdag.to_amat(node_list=list(range(self.cfg.n_vars)))
+        G = G.astype(np.float32)
         
         # AVICI LINEAR: heterogeneous noise scale per variable
         rng_noise = np.random.default_rng(seed=None)
         noise_scales = rng_noise.uniform(low=0.2, high=2.0, size=self.cfg.n_vars).astype(np.float32)
         
-        _, W = sample_linear_sem(A, self.cfg.n_obs, noise_scales, seed=None)
-        G = (np.abs(W) > 1e-8).astype(np.float32)
-        
-        # Sample interventional data
-        rng = np.random.default_rng(seed=None)
-        interv_vars = sorted(rng.choice(self.cfg.n_vars, size=self.cfg.n_interv_vars, replace=False).tolist())
-        
-        X_np, interv_mask = sample_interventional_data(
-            A, W,
-            n_obs=self.cfg.n_obs - self.cfg.n_interv_obs,
-            n_interv=self.cfg.n_interv_obs // self.cfg.n_interv_vars,
-            interv_vars=interv_vars,
-            noise_scales=noise_scales,
-            seed=None
-        )
+        # Sample observational data only
+        X_np, W = sample_linear_sem(A, self.cfg.n_obs, noise_scales, seed=None)
         
         return {
             'A': A,
             'G': G,
             'X': X_np,
-            'interv_mask': interv_mask,
         }
     
     @override
@@ -252,21 +246,18 @@ def collate_causal_graphs(batch: list[dict[str, np.ndarray]]) -> dict[str, Any]:
         
     Returns:
         Batched dictionary with:
-            - 'A': list of adjacency matrices
-            - 'G': stacked binary adjacency [batch_size, n_vars, n_vars]
-            - 'X': list of data matrices
-            - 'interv_mask': list of intervention masks
+            - 'A': list of adjacency matrices (DAG)
+            - 'G': stacked CPDAG adjacency [batch_size, n_vars, n_vars]
+            - 'X': list of data matrices (observational only)
     """
     batch_A = [item['A'] for item in batch]
     batch_G = np.stack([item['G'] for item in batch], axis=0)
     batch_X = [item['X'] for item in batch]
-    batch_interv_mask = [item['interv_mask'] for item in batch]
     
     return {
         'A': batch_A,
         'G': batch_G,
         'X': batch_X,
-        'interv_mask': batch_interv_mask,
     }
 
 
@@ -505,9 +496,9 @@ class CausalGraphDecoder(nn.Module):
         self.proj_v = nn.Linear(emb_dim, emb_dim)
         self.ln_u = nn.LayerNorm(emb_dim)
         self.ln_v = nn.LayerNorm(emb_dim)
-        # Initialize close to AVICI defaults
-        self.log_temp = nn.Parameter(torch.tensor(0.0))
-        self.bias = nn.Parameter(torch.tensor(-3.0))
+        # Initialize close to AVICI defaults (1D tensors for FSDP compatibility)
+        self.log_temp = nn.Parameter(torch.tensor([0.0]))
+        self.bias = nn.Parameter(torch.tensor([-3.0]))
 
     @override
     def forward(self, node_emb: torch.Tensor) -> torch.Tensor:  # type: ignore[override]
@@ -632,7 +623,7 @@ def build_tabpfn_backbone(cfg: DemoConfig) -> tuple[nn.Module, Any]:
     model, _criterion, config = load_model_criterion_config(
         cfg.model_path,
         check_bar_distribution_criterion=False,
-        cache_trainset_representation=True,
+        cache_trainset_representation=False,
         which="classifier",
         version="v2",
         download=True,
@@ -645,25 +636,26 @@ def build_tabpfn_backbone(cfg: DemoConfig) -> tuple[nn.Module, Any]:
 # (re-implements a minimal subset of PerFeatureTransformer.forward)
 # ----------------------------
 
-def prepare_data_with_interventions(X: np.ndarray, interv_mask: np.ndarray) -> np.ndarray:
-    """Interleave variable values and intervention masks for TabPFN input.
+def prepare_data_for_tabpfn(X: np.ndarray) -> np.ndarray:
+    """Interleave variable values with zero columns for TabPFN input.
+    
+    TabPFN groups features in pairs (features_per_group=2), so we need to
+    maintain the interleaved structure even with observational-only data.
     
     Args:
-        X: [n_obs, n_vars] - variable values
-        interv_mask: [n_obs, n_vars] - binary intervention indicators
+        X: [n_obs, n_vars] - variable values (observational data only)
     
     Returns:
-        X_interleaved: [n_obs, n_vars*2] - interleaved format [val1, interv1, val2, interv2, ...]
+        X_interleaved: [n_obs, n_vars*2] - interleaved format [val1, 0, val2, 0, ...]
     """
     n_obs, n_vars = X.shape
     X_interleaved = np.zeros((n_obs, n_vars * 2), dtype=np.float32)
     
-    # Interleave: [val1, interv1, val2, interv2, ...]
+    # Interleave: [val1, 0, val2, 0, ...]
     X_interleaved[:, 0::2] = X  # values at even indices
-    X_interleaved[:, 1::2] = interv_mask  # masks at odd indices
+    X_interleaved[:, 1::2] = 0  # all zeros at odd indices (no interventions)
     
     # Apply minimal preprocessing: z-normalize ONLY the value columns (even indices)
-    # This mimics AVICI's standardization of data values while keeping intervention masks binary
     for i in range(0, n_vars * 2, 2):
         col = X_interleaved[:, i]
         mean = col.mean()
@@ -671,15 +663,14 @@ def prepare_data_with_interventions(X: np.ndarray, interv_mask: np.ndarray) -> n
         if std > 0:
             X_interleaved[:, i] = (col - mean) / std
     
-    # Note: intervention mask columns (odd indices) remain binary [0, 1]
+    # Note: zero columns (odd indices) remain all zeros
     
     return X_interleaved
 
 
 def get_node_embeddings_from_tabpfn_batched(
     model: Any,
-    batch_X: list[np.ndarray],
-    batch_interv_mask: list[np.ndarray]
+    batch_X: list[np.ndarray]
 ) -> torch.Tensor:
     """Compute per-variable embeddings for a batch of graphs using TabPFN's batch dimension.
     
@@ -688,8 +679,7 @@ def get_node_embeddings_from_tabpfn_batched(
     
     Args:
         model: TabPFN model (features_per_group=2 from checkpoint)
-        batch_X: list of [S, n_vars] - variable values for each graph
-        batch_interv_mask: list of [S, n_vars] - intervention indicators for each graph
+        batch_X: list of [S, n_vars] - variable values for each graph (observational only)
     
     Returns:
         node_emb: [batch_size, n_vars, E] - embeddings for all graphs
@@ -702,8 +692,8 @@ def get_node_embeddings_from_tabpfn_batched(
     
     # Prepare interleaved data for all graphs
     batch_X_interleaved = []
-    for X_np, interv_mask in zip(batch_X, batch_interv_mask):
-        X_interleaved = prepare_data_with_interventions(X_np, interv_mask)
+    for X_np in batch_X:
+        X_interleaved = prepare_data_for_tabpfn(X_np)
         batch_X_interleaved.append(X_interleaved)
     
     # All graphs should have same shape
@@ -740,7 +730,7 @@ def get_node_embeddings_from_tabpfn_batched(
     embedded_x = model.encoder(
         x_flat,
         single_eval_pos=S,
-        cache_trainset_representation=True,
+        cache_trainset_representation=False,
     )  # [s, batch_size*f, e]
     embedded_x = einops.rearrange(embedded_x, "s (b f) e -> b s f e", b=batch_size)  # [batch_size, S, F, E]
     
@@ -749,7 +739,7 @@ def get_node_embeddings_from_tabpfn_batched(
     embedded_y = model.y_encoder(
         y_dict,
         single_eval_pos=S,
-        cache_trainset_representation=True,
+        cache_trainset_representation=False,
     ).transpose(0, 1)  # [batch_size, S, E]
     
     # Add embeddings (positional, DAG if configured)
@@ -770,7 +760,7 @@ def get_node_embeddings_from_tabpfn_batched(
     enc_out = model.transformer_encoder(
         embedded_input,
         single_eval_pos=S,
-        cache_trainset_representation=True,
+        cache_trainset_representation=False,
     )  # [batch_size, S, F+1, E]
     
     # Extract feature tokens - keep S dimension (don't pool yet)
@@ -783,7 +773,6 @@ def get_node_embeddings_from_tabpfn_batched(
 def get_node_embeddings_from_intermediate_layer(
     model: Any,
     batch_X: list[np.ndarray],
-    batch_interv_mask: list[np.ndarray],
     intermediate_layer_idx: int = 4
 ) -> torch.Tensor:
     """Extract node embeddings from intermediate TabPFN layer.
@@ -793,8 +782,7 @@ def get_node_embeddings_from_intermediate_layer(
     
     Args:
         model: TabPFN model (features_per_group=2 from checkpoint)
-        batch_X: list of [S, n_vars] - variable values for each graph
-        batch_interv_mask: list of [S, n_vars] - intervention indicators for each graph
+        batch_X: list of [S, n_vars] - variable values for each graph (observational only)
         intermediate_layer_idx: Which transformer layer to extract from (0-based)
     
     Returns:
@@ -808,8 +796,8 @@ def get_node_embeddings_from_intermediate_layer(
     
     # Prepare interleaved data for all graphs
     batch_X_interleaved = []
-    for X_np, interv_mask in zip(batch_X, batch_interv_mask):
-        X_interleaved = prepare_data_with_interventions(X_np, interv_mask)
+    for X_np in batch_X:
+        X_interleaved = prepare_data_for_tabpfn(X_np)
         batch_X_interleaved.append(X_interleaved)
     
     # All graphs should have same shape
@@ -846,7 +834,7 @@ def get_node_embeddings_from_intermediate_layer(
     embedded_x = model.encoder(
         x_flat,
         single_eval_pos=S,
-        cache_trainset_representation=True,
+        cache_trainset_representation=False,
     )  # [s, batch_size*f, e]
     embedded_x = einops.rearrange(embedded_x, "s (b f) e -> b s f e", b=batch_size)  # [batch_size, S, F, E]
     
@@ -855,7 +843,7 @@ def get_node_embeddings_from_intermediate_layer(
     embedded_y = model.y_encoder(
         y_dict,
         single_eval_pos=S,
-        cache_trainset_representation=True,
+        cache_trainset_representation=False,
     ).transpose(0, 1)  # [batch_size, S, E]
     
     # Add embeddings (positional, DAG if configured)
@@ -878,7 +866,7 @@ def get_node_embeddings_from_intermediate_layer(
     target_layer = min(intermediate_layer_idx, num_layers - 1)  # Clamp to valid range
     
     for i, layer in enumerate(model.transformer_encoder.layers):
-        x = layer(x, single_eval_pos=S, cache_trainset_representation=True)
+        x = layer(x, single_eval_pos=S, cache_trainset_representation=False)
         if i == target_layer:
             break
     
@@ -955,34 +943,57 @@ def compute_f1_score(y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, float]
     }
 
 
-def compute_sid_safe(y_true: np.ndarray, y_pred: np.ndarray, edge_direction: str = "from row to column") -> dict[str, float]:
-    """Compute SID with graceful handling of cyclic graphs.
+def convert_cpdag_to_gadjid_format(adj_matrix: np.ndarray) -> np.ndarray:
+    """Convert CPDAG adjacency matrix to gadjid format.
     
-    If prediction is a DAG: computes SID normally
-    If prediction has cycles: falls back to SHD and marks SID as invalid
+    causaldag uses symmetric 1s for undirected edges (both [i,j]=1 and [j,i]=1).
+    gadjid requires 2 in ONE direction only for undirected edges.
     
     Args:
-        y_true: [d, d] ground truth adjacency matrix (binary)
-        y_pred: [d, d] predicted adjacency matrix (binary)
-        edge_direction: edge direction convention for gadjid
+        adj_matrix: [d, d] adjacency matrix with symmetric 1s for undirected edges
     
     Returns:
-        dict with 'sid', 'sid_normalised', 'shd', 'is_dag', 'has_cycles'
+        [d, d] adjacency matrix in gadjid format (2 for undirected, 1 for directed)
     """
+    n = adj_matrix.shape[0]
+    result = adj_matrix.copy().astype('int8')
     
-    if is_dag(y_pred):
-        sid_normalised, sid_count = compute_sid(y_true, y_pred, edge_direction)
-        return {
-            'sid': sid_count,
-            'sid_normalised': sid_normalised,
-            'is_dag': 1.0,
-        }
-    else:
-        return {
-            'sid': float('nan'),  # Invalid
-            'sid_normalised': float('nan'),  # Invalid
-            'is_dag': 0.0,
-        }
+    # For undirected edges (symmetric 1s), convert to 2 in lower triangle only
+    for i in range(n):
+        for j in range(i+1, n):  # upper triangle
+            if adj_matrix[i,j] == 1 and adj_matrix[j,i] == 1:
+                # Undirected edge: set lower triangle to 2, upper to 0
+                result[j,i] = 2
+                result[i,j] = 0
+    
+    return result
+
+
+def compute_shd_metric(y_true: np.ndarray, y_pred: np.ndarray) -> dict[str, float]:
+    """Compute Structural Hamming Distance (SHD) between graphs.
+    
+    SHD counts the number of edge additions, deletions, and reversals needed
+    to transform the predicted graph into the true graph. Works for any graph,
+    including CPDAGs (not just DAGs).
+    
+    Args:
+        y_true: [d, d] ground truth CPDAG adjacency matrix (may have symmetric 1s for undirected)
+        y_pred: [d, d] predicted adjacency matrix (binary)
+    
+    Returns:
+        dict with 'shd' (count) and 'shd_normalised' (normalized by max edges)
+    """
+    # Convert both matrices to gadjid format (2 for undirected edges)
+    y_true_gadjid = convert_cpdag_to_gadjid_format(y_true)
+    y_pred_gadjid = convert_cpdag_to_gadjid_format(y_pred)
+    
+    # gadjid.shd returns (normalized_shd, shd_count)
+    shd_normalised, shd_count = shd(y_true_gadjid, y_pred_gadjid)
+    
+    return {
+        'shd': float(shd_count),
+        'shd_normalised': float(shd_normalised),
+    }
 
 
 # ----------------------------
@@ -1030,22 +1041,22 @@ class CausalDecoderLightningModule(pl.LightningModule):
         self.backbone.eval()
         
         # Initialize Polyak-averaged parameters (EMA) for trainable components only
-        self.register_buffer('ave_params_initialized', torch.tensor(False))
+        self.register_buffer('ave_params_initialized', torch.tensor([False]))
         self.ave_params: dict[str, torch.Tensor] = {}
         
         # Initialize dual variable and Polyak-averaged penalty for dual acyclicity scheduling
-        self.register_buffer('dual', torch.tensor(0.0))
-        self.register_buffer('dual_penalty_polyak', torch.tensor(0.0))
+        self.register_buffer('dual', torch.tensor([0.0]))
+        self.register_buffer('dual_penalty_polyak', torch.tensor([0.0]))
         
         # Save hyperparameters for checkpointing
         self.save_hyperparameters(ignore=['backbone'])
     
     @override
-    def forward(self, batch_X: list[np.ndarray], batch_interv_mask: list[np.ndarray]) -> torch.Tensor:  # type: ignore[override]
+    def forward(self, batch_X: list[np.ndarray]) -> torch.Tensor:  # type: ignore[override]
         """Forward pass: get intermediate embeddings, process through causal transformer, and decode to logits."""
         # Extract intermediate representations from TabPFN
         node_emb = get_node_embeddings_from_intermediate_layer(
-            self.backbone, batch_X, batch_interv_mask,
+            self.backbone, batch_X,
             intermediate_layer_idx=self.h.intermediate_layer_idx
         )
         
@@ -1064,7 +1075,8 @@ class CausalDecoderLightningModule(pl.LightningModule):
     def training_step(self, batch: dict[str, Any], batch_idx: int) -> torch.Tensor:  # type: ignore[override]
         """Training step."""
         # Initialize Polyak-averaged parameters on first step for all trainable components
-        if not self.ave_params_initialized:
+        # Use [0] indexing for FSDP-compatible 1D tensor
+        if not self.ave_params_initialized[0]:
             self.ave_params = {}
             # Include decoder parameters
             for name, param in self.decoder.named_parameters():
@@ -1076,11 +1088,11 @@ class CausalDecoderLightningModule(pl.LightningModule):
             if self.emb_projection:
                 for name, param in self.emb_projection.named_parameters():
                     self.ave_params[f"emb_projection.{name}"] = param.clone().detach()
-            self.ave_params_initialized = torch.tensor(True)
+            # Use 1D tensor for FSDP compatibility
+            self.ave_params_initialized[0] = True
         
         # Extract batch data
         batch_X = batch['X']
-        batch_interv_mask = batch['interv_mask']
         G_batch = batch['G']
         batch_size = len(batch_X)
         
@@ -1088,7 +1100,7 @@ class CausalDecoderLightningModule(pl.LightningModule):
         G_t = torch.as_tensor(G_batch, device=self.device, dtype=torch.float32)
         
         # Forward pass
-        logits = self(batch_X, batch_interv_mask)
+        logits = self(batch_X)
         
         # AVICI-style BCE with label smoothing and positive weighting
         diag_mask = torch.eye(logits.size(-1), device=logits.device, dtype=torch.bool)
@@ -1118,7 +1130,8 @@ class CausalDecoderLightningModule(pl.LightningModule):
         elif self.h.acyclicity_schedule == "linear":
             acyc_weight = self.h.acyclicity_weight * max(0.0, (step - self.h.acyclicity_burnin) * self.h.acyclicity_linear_rate)
         elif self.h.acyclicity_schedule == "dual":
-            acyc_weight = self.h.acyclicity_weight * self.dual.item()
+            # Use [0] indexing for FSDP-compatible 1D tensor
+            acyc_weight = self.h.acyclicity_weight * self.dual[0].item()
         else:
             raise ValueError(f"Unknown acyclicity schedule: {self.h.acyclicity_schedule}")
         
@@ -1142,10 +1155,11 @@ class CausalDecoderLightningModule(pl.LightningModule):
         if self.h.acyclicity_schedule == "dual":
             with torch.no_grad():
                 # Polyak averaging of acyclicity penalty
+                # Use [0] indexing for FSDP-compatible 1D tensors
                 if step == 0:
-                    self.dual_penalty_polyak = acyc_penalty.clone()
+                    self.dual_penalty_polyak[0] = acyc_penalty
                 else:
-                    self.dual_penalty_polyak = (1 - self.h.acyclicity_polyak) * self.dual_penalty_polyak + self.h.acyclicity_polyak * acyc_penalty
+                    self.dual_penalty_polyak[0] = (1 - self.h.acyclicity_polyak) * self.dual_penalty_polyak[0] + self.h.acyclicity_polyak * acyc_penalty
                 
                 # Dual learning rate with warmup
                 if self.h.acyclicity_warmup:
@@ -1156,8 +1170,9 @@ class CausalDecoderLightningModule(pl.LightningModule):
                     effective_burnin = self.h.acyclicity_burnin
                 
                 # Update dual every inner_step iterations after burnin
+                # Use [0] indexing for FSDP-compatible 1D tensors
                 if (step % self.h.acyclicity_inner_step == 0) and (step > effective_burnin):
-                    self.dual = self.dual + dual_lr * self.dual_penalty_polyak
+                    self.dual[0] = self.dual[0] + dual_lr * self.dual_penalty_polyak[0]
         
         # Logging
         with torch.no_grad():
@@ -1174,8 +1189,9 @@ class CausalDecoderLightningModule(pl.LightningModule):
         self.log('metrics/neg_mae', neg_mae, batch_size=batch_size)
 
         if self.h.acyclicity_schedule == "dual":
-            self.log('acyclicity/dual', self.dual, batch_size=batch_size)
-            self.log('acyclicity/dual_penalty_polyak', self.dual_penalty_polyak, batch_size=batch_size)
+            # Use [0] indexing for FSDP-compatible 1D tensors
+            self.log('acyclicity/dual', self.dual[0], batch_size=batch_size)
+            self.log('acyclicity/dual_penalty_polyak', self.dual_penalty_polyak[0], batch_size=batch_size)
         
         # Log SID and example predictions at the first step of every checkpoint_interval
         if step % self.cfg.checkpoint_interval == 0:
@@ -1185,17 +1201,15 @@ class CausalDecoderLightningModule(pl.LightningModule):
                 G_pred_first = (probs_first > self.cfg.decision_threshold).astype(np.float32)
                 G_true_first = G_t[0].cpu().numpy()
                 
-                # Compute SID for first example
-                sid_metrics = compute_sid_safe(
+                # Compute SHD for first example
+                shd_metrics = compute_shd_metric(
                     G_true_first.astype('int8'),
-                    G_pred_first.astype('int8'),
-                    edge_direction="from row to column"
+                    G_pred_first.astype('int8')
                 )
                 
-                # Log SID metrics
-                self.log('train_checkpoint/sid', sid_metrics['sid'], batch_size=batch_size)
-                self.log('train_checkpoint/sid_normalised', sid_metrics['sid_normalised'], batch_size=batch_size)
-                self.log('train_checkpoint/is_dag', sid_metrics['is_dag'], batch_size=batch_size)
+                # Log SHD metrics
+                self.log('train_checkpoint/shd', shd_metrics['shd'], batch_size=batch_size)
+                self.log('train_checkpoint/shd_normalised', shd_metrics['shd_normalised'], batch_size=batch_size)
                 
                 # Log example prediction/ground truth/probability matrices
                 if isinstance(self.logger, WandbLogger):
@@ -1223,12 +1237,12 @@ class CausalDecoderLightningModule(pl.LightningModule):
         # Extract batch data
         batch_size = len(batch['X'])
         batch_X = batch['X']
-        batch_interv_mask = batch['interv_mask']
         G_batch = batch['G']
         
         # Use Polyak-averaged parameters for evaluation
+        # Use [0] indexing for FSDP-compatible 1D tensor
         original_params = {}
-        if self.ave_params_initialized:
+        if self.ave_params_initialized[0]:
             # Save original decoder parameters
             for name, param in self.decoder.named_parameters():
                 original_params[f"decoder.{name}"] = param.clone()
@@ -1244,11 +1258,12 @@ class CausalDecoderLightningModule(pl.LightningModule):
                     param.data.copy_(self.ave_params[f"emb_projection.{name}"])
         
         # Forward pass
-        logits = self(batch_X, batch_interv_mask)
+        logits = self(batch_X)
         probs_batch = torch.sigmoid(logits).cpu().numpy()
         
         # Restore original parameters
-        if self.ave_params_initialized:
+        # Use [0] indexing for FSDP-compatible 1D tensor
+        if self.ave_params_initialized[0]:
             # Restore decoder parameters
             for name, param in self.decoder.named_parameters():
                 param.data.copy_(original_params[f"decoder.{name}"])
@@ -1268,28 +1283,26 @@ class CausalDecoderLightningModule(pl.LightningModule):
             
             metrics = compute_f1_score(G_batch[b], G_pred)
             
-            # Compute SID with graceful cycle handling
-            sid_metrics = compute_sid_safe(
-                G_batch[b].astype('int8'), 
-                G_pred.astype('int8'), 
-                edge_direction="from row to column"  # A[i,j]=1 means i→j
+            # Compute SHD
+            shd_metrics = compute_shd_metric(
+                G_batch[b].astype('int8'),
+                G_pred.astype('int8')
             )
-            metrics.update(sid_metrics)
+            metrics.update(shd_metrics)
             all_metrics.append(metrics)
         
-        # Average metrics across batch (use nanmean for SID to handle cycles)
+        # Average metrics across batch
         avg_metrics = {
             'val_precision': float(np.mean([m['precision'] for m in all_metrics])),
             'val_recall': float(np.mean([m['recall'] for m in all_metrics])),
             'val_f1': float(np.mean([m['f1'] for m in all_metrics])),
-            'val_sid': float(np.nanmean([m['sid'] for m in all_metrics])),  # nanmean ignores NaN from cycles
-            'val_sid_normalised': float(np.nanmean([m['sid_normalised'] for m in all_metrics])),
-            'val_is_dag': float(np.mean([m['is_dag'] for m in all_metrics])),  # Fraction of DAGs
+            'val_shd': float(np.mean([m['shd'] for m in all_metrics])),
+            'val_shd_normalised': float(np.mean([m['shd_normalised'] for m in all_metrics])),
         }
         
         # Log metrics
         for key, value in avg_metrics.items():
-            self.log(key, value, prog_bar=True, batch_size=batch_size)
+            self.log(key, value, prog_bar=True, batch_size=batch_size, sync_dist=True)
         
         # Store first graph's matrices for visualization
         if batch_idx == 0:
@@ -1451,7 +1464,7 @@ def train_demo(cfg: DemoConfig, h: Hyperparameters) -> dict[str, float]:
     trainer = pl.Trainer(
         max_steps=h.steps,
         accelerator='auto',
-        devices=1,
+        devices=8,
         logger=wandb_logger,
         callbacks=[checkpoint_callback, matrix_viz_callback],
         gradient_clip_val=h.grad_clip if h.grad_clip > 0 else None,
@@ -1460,6 +1473,7 @@ def train_demo(cfg: DemoConfig, h: Hyperparameters) -> dict[str, float]:
         log_every_n_steps=1,
         val_check_interval=cfg.checkpoint_interval,  # Run validation at checkpoint intervals,
         check_val_every_n_epoch=None,
+        strategy="ddp",
     )
     
     # 8) Train
@@ -1473,9 +1487,8 @@ def train_demo(cfg: DemoConfig, h: Hyperparameters) -> dict[str, float]:
         'precision': final_metrics[0]['val_precision'],
         'recall': final_metrics[0]['val_recall'],
         'f1': final_metrics[0]['val_f1'],
-        'sid': final_metrics[0]['val_sid'],
-        'sid_normalised': final_metrics[0]['val_sid_normalised'],
-        'is_dag': final_metrics[0]['val_is_dag'],
+        'shd': final_metrics[0]['val_shd'],
+        'shd_normalised': final_metrics[0]['val_shd_normalised'],
     }
     
     return metrics
@@ -1495,10 +1508,10 @@ def run_benchmark(cfg: DemoConfig, h: Hyperparameters) -> None:
         f1_scores = [m['f1'] for m in all_metrics]
         precision_scores = [m['precision'] for m in all_metrics]
         recall_scores = [m['recall'] for m in all_metrics]
-        sid_scores = [m['sid'] for m in all_metrics]
+        shd_scores = [m['shd'] for m in all_metrics]
         
         print(f"\n=== Aggregate Results over {cfg.n_test_instances} instances ===")
-        print(f"SID: {np.mean(sid_scores):.4f} ± {np.std(sid_scores):.4f}")
+        print(f"SHD: {np.mean(shd_scores):.4f} ± {np.std(shd_scores):.4f}")
         print(f"F1: {np.mean(f1_scores):.4f} ± {np.std(f1_scores):.4f}")
         print(f"Precision: {np.mean(precision_scores):.4f} ± {np.std(precision_scores):.4f}")
         print(f"Recall: {np.mean(recall_scores):.4f} ± {np.std(recall_scores):.4f}")
