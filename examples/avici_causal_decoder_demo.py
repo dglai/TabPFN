@@ -36,9 +36,9 @@ def set_seed(seed: int = 0) -> None:
 class DemoConfig:
     # Data - matching AVICI LINEAR test:train configuration exactly
     n_vars: int = 6  # d=30 from paper
-    n_obs: int = 16  # n=1000 total observations (500 obs + 500 int)
+    n_obs: int = 128  # n=1000 total observations (500 obs + 500 int)
     edge_prob: float = 2 / 6  # 2 / 30 edges_per_var=2 on average for d=30
-    n_interv_obs: int = 8  # half observational, half interventional (like paper)
+    n_interv_obs: int = 64  # half observational, half interventional (like paper)
     n_interv_vars: int = 2  # intervene on ALL variables (n_interv_vars: -1 in AVICI config means all)
     # Evaluation
     n_test_instances: int = 1  # number of test instances to average over
@@ -48,7 +48,7 @@ class DemoConfig:
 
     # Checkpointing
     checkpoint_dir: str = "~/autodl-tmp/checkpoints"  # directory to save checkpoints
-    checkpoint_interval: int = 1000  # checkpoint every N steps
+    checkpoint_interval: int = 10000  # checkpoint every N steps
 
     # Logging (evaluation/monitoring)
     wandb_enabled: bool = True
@@ -71,7 +71,7 @@ class Hyperparameters:
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     batch_size: int = 48  # Number of graphs per batch
     # DataLoader configuration (cache-on-the-fly mode)
-    num_batches: Optional[int] = 10  # Max batches to cache (None = infinite, never caches)
+    num_batches: Optional[int] = None  # Max batches to cache (None = infinite, never caches)
     # Evaluation configuration
     eval_num_batches: int = 1  # Number of batches for evaluation set
     # Optimizer (matching AVICI defaults)
@@ -92,6 +92,12 @@ class Hyperparameters:
     acyclicity_warmup: bool = True  # AVICI default: warmup dual_lr gradually
     acyclicity_polyak: float = 1e-4  # AVICI default: Polyak averaging rate for penalty
     power_iters: int = 10  # AVICI default: 10 power iterations
+    
+    # New transformer configuration for causal discovery
+    intermediate_layer_idx: int = 4  # Which TabPFN layer to extract from (0-based indexing)
+    causal_transformer_layers: int = 8  # Number of layers in new transformer
+    num_prompt_tokens: int = 4  # Number of learnable prompt tokens
+    causal_emb_dim: Optional[int] = None  # If None, use TabPFN's embedding dim
     
     def __post_init__(self):
         # Set default LR drop steps if not provided
@@ -175,7 +181,7 @@ class CausalGraphDataset(Dataset):
             return self.num_graphs
         else:
             # For online generation, return a large number
-            return h.steps  # Effectively infinite
+            return h.steps * h.batch_size  # Effectively infinite
     
     def _shuffle_cache(self) -> None:
         """Shuffle the cache indices for random access."""
@@ -407,6 +413,84 @@ def sample_interventional_data(
 # ----------------------------
 # AVICI-style cosine decoder (PyTorch)
 # ----------------------------
+class CausalTransformer(nn.Module):
+    """New transformer with learnable prompt tokens for causal discovery.
+    
+    This transformer processes intermediate TabPFN representations and adds
+    learnable prompt tokens to provide causal discovery-specific context.
+    """
+
+    def __init__(
+        self, 
+        config: Any,
+        num_layers: int = 8,
+        num_prompt_tokens: int = 4,
+        emb_dim: int = 512
+    ):
+        super().__init__()
+        self.num_prompt_tokens = num_prompt_tokens
+        self.emb_dim = emb_dim
+        
+        # Learnable prompt tokens - these will be trained to encode causal discovery knowledge
+        self.prompt_embeddings = nn.Parameter(
+            torch.randn(1, 1, num_prompt_tokens, emb_dim) * 0.02
+        )
+        
+        # Import layer components from TabPFN
+        from tabpfn.architectures.base.layer import PerFeatureEncoderLayer
+        from tabpfn.architectures.base.transformer import LayerStack
+        
+        # Create transformer layers using TabPFN's architecture
+        layer_creator = lambda: PerFeatureEncoderLayer(
+            config=config,
+            dim_feedforward=emb_dim * getattr(config, 'nhid_factor', 4),
+            activation="gelu",
+            zero_init=True,
+        )
+        
+        self.transformer_layers = LayerStack.of_repeated_layer(
+            layer_creator=layer_creator,
+            num_layers=num_layers,
+            recompute_each_layer=False,
+        )
+    
+    @override
+    def forward(self, node_emb: torch.Tensor) -> torch.Tensor:  # type: ignore[override]
+        """
+        Args:
+            node_emb: [batch_size, S, n_vars, emb_dim] from intermediate TabPFN layer
+                     where S is the number of observations
+        
+        Returns:
+            pooled_emb: [batch_size, n_vars, emb_dim] after transformer processing and pooling
+        """
+        batch_size, S, n_vars, emb_dim = node_emb.shape
+        
+        # Expand prompt tokens for batch AND sequence length
+        prompt_tokens = self.prompt_embeddings.expand(batch_size, S, -1, -1)
+        # Shape: [batch_size, S, num_prompt_tokens, emb_dim]
+        
+        # Concatenate prompt tokens with node embeddings (along token dimension)
+        transformer_input = torch.cat([prompt_tokens, node_emb], dim=2)
+        # Shape: [batch_size, S, num_prompt_tokens + n_vars, emb_dim]
+        
+        # Process through transformer layers with actual sequence length
+        enhanced_emb = self.transformer_layers(
+            transformer_input,
+            single_eval_pos=S,  # Use actual sequence length, not 1
+            cache_trainset_representation=False,
+        )
+        
+        # Extract only the variable embeddings (skip prompt tokens)
+        variable_emb = enhanced_emb[:, :, self.num_prompt_tokens:, :]
+        # Shape: [batch_size, S, n_vars, emb_dim]
+        
+        # Pool over observations (max pooling like AVICI)
+        pooled_emb = variable_emb.max(dim=1).values  # [batch_size, n_vars, emb_dim]
+        
+        return pooled_emb
+
+
 
 class CausalGraphDecoder(nn.Module):
     """AVICI-like decoder: cosine bilinear with learned temperature and bias.
@@ -536,13 +620,16 @@ def acyclicity_penalty_from_logits(logits: torch.Tensor, iters: int = 10) -> tor
 # Helper: Build a tiny TabPFN backbone
 # ----------------------------
 
-def build_tabpfn_backbone(cfg: DemoConfig) -> nn.Module:
-    """Return a TabPFN backbone loaded from official pretrained weights.
+def build_tabpfn_backbone(cfg: DemoConfig) -> tuple[nn.Module, Any]:
+    """Return a TabPFN backbone and config loaded from official pretrained weights.
 
     This will attempt to download/use cached TabPFN-v2 classifier weights.
     If loading fails, the error is propagated (no fallback to random init).
+    
+    Returns:
+        tuple: (model, config) where config is the ModelConfig from the checkpoint
     """
-    model, _criterion, _config = load_model_criterion_config(
+    model, _criterion, config = load_model_criterion_config(
         cfg.model_path,
         check_bar_distribution_criterion=False,
         cache_trainset_representation=True,
@@ -550,7 +637,7 @@ def build_tabpfn_backbone(cfg: DemoConfig) -> nn.Module:
         version="v2",
         download=True,
     )
-    return model
+    return model, config
 
 
 # ----------------------------
@@ -686,12 +773,121 @@ def get_node_embeddings_from_tabpfn_batched(
         cache_trainset_representation=True,
     )  # [batch_size, S, F+1, E]
     
-    # Extract feature tokens and pool across S (AVICI uses max over observations)
+    # Extract feature tokens - keep S dimension (don't pool yet)
     feature_tokens = enc_out[:, :, :-1, :]  # [batch_size, S, F, E] where F=n_vars
-    node_emb = feature_tokens.max(dim=1).values  # [batch_size, n_vars, E]
     
-    # Now node_emb[b, i, :] is the embedding for variable i in graph b
-    return node_emb
+    # Return with observation dimension intact
+    # Now feature_tokens[b, s, i, :] is the embedding for variable i at observation s in graph b
+    return feature_tokens  # [batch_size, S, n_vars, E]
+
+def get_node_embeddings_from_intermediate_layer(
+    model: Any,
+    batch_X: list[np.ndarray],
+    batch_interv_mask: list[np.ndarray],
+    intermediate_layer_idx: int = 4
+) -> torch.Tensor:
+    """Extract node embeddings from intermediate TabPFN layer.
+    
+    This function extracts representations from a specific intermediate layer
+    of the TabPFN transformer, rather than using the final layer output.
+    
+    Args:
+        model: TabPFN model (features_per_group=2 from checkpoint)
+        batch_X: list of [S, n_vars] - variable values for each graph
+        batch_interv_mask: list of [S, n_vars] - intervention indicators for each graph
+        intermediate_layer_idx: Which transformer layer to extract from (0-based)
+    
+    Returns:
+        node_emb: [batch_size, n_vars, E] - embeddings from intermediate layer
+    """
+    import einops  # local import
+    
+    batch_size = len(batch_X)
+    device = next(model.parameters()).device
+    dtype = next(model.parameters()).dtype
+    
+    # Prepare interleaved data for all graphs
+    batch_X_interleaved = []
+    for X_np, interv_mask in zip(batch_X, batch_interv_mask):
+        X_interleaved = prepare_data_with_interventions(X_np, interv_mask)
+        batch_X_interleaved.append(X_interleaved)
+    
+    # All graphs should have same shape
+    S, D_orig = batch_X_interleaved[0].shape
+    # D_orig = n_vars * 2 (interleaved format)
+    
+    # Stack into TabPFN's batch format: [S, batch_size, D]
+    x_main = torch.stack([
+        torch.as_tensor(X_int, device=device, dtype=dtype) 
+        for X_int in batch_X_interleaved
+    ], dim=1)  # [S, batch_size, D]
+    
+    # y: dummy zeros for encoder
+    y_main = torch.zeros(S, batch_size, 1, device=device, dtype=dtype)  # [S, batch_size, 1]
+    
+    # Padding to multiple of features_per_group
+    fpg = int(model.features_per_group)  # This is 2 from checkpoint
+    D = D_orig
+    missing = (fpg - (D % fpg)) % fpg
+    if missing > 0:
+        pad = torch.zeros(S, batch_size, missing, device=device, dtype=dtype)
+        x_main = torch.cat([x_main, pad], dim=-1)
+        D = D + missing
+    
+    # Rearrange to groups: [B, S, F, n]
+    # With fpg=2 and D=n_vars*2, F = n_vars
+    x_b_s_f_n = x_main.permute(1, 0, 2).contiguous()  # [batch_size, S, D]
+    F = D // fpg  # F = n_vars
+    x_b_s_f_n = x_b_s_f_n.view(batch_size, S, F, int(fpg))
+    
+    # Encode X: SequentialEncoder expects dict and flattened (s, b*f, n)
+    x_dict = {"main": x_b_s_f_n}
+    x_flat = {k: einops.rearrange(v, "b s f n -> s (b f) n") for k, v in x_dict.items()}
+    embedded_x = model.encoder(
+        x_flat,
+        single_eval_pos=S,
+        cache_trainset_representation=True,
+    )  # [s, batch_size*f, e]
+    embedded_x = einops.rearrange(embedded_x, "s (b f) e -> b s f e", b=batch_size)  # [batch_size, S, F, E]
+    
+    # Encode y (dummy zeros)
+    y_dict = {"main": y_main}
+    embedded_y = model.y_encoder(
+        y_dict,
+        single_eval_pos=S,
+        cache_trainset_representation=True,
+    ).transpose(0, 1)  # [batch_size, S, E]
+    
+    # Add embeddings (positional, DAG if configured)
+    embedded_x, embedded_y = model.add_embeddings(
+        embedded_x,
+        embedded_y,
+        data_dags=None,
+        num_features=D,
+        seq_len=S,
+        cache_embeddings=True,
+        use_cached_embeddings=False,
+    )
+    
+    # Concatenate feature tokens with target token
+    embedded_input = torch.cat([embedded_x, embedded_y.unsqueeze(2)], dim=2)  # [batch_size, S, F+1, E]
+    
+    # Run through transformer layers up to the specified intermediate layer
+    x = embedded_input
+    num_layers = len(model.transformer_encoder.layers)
+    target_layer = min(intermediate_layer_idx, num_layers - 1)  # Clamp to valid range
+    
+    for i, layer in enumerate(model.transformer_encoder.layers):
+        x = layer(x, single_eval_pos=S, cache_trainset_representation=True)
+        if i == target_layer:
+            break
+    
+    # Extract feature tokens - keep S dimension (don't pool yet)
+    feature_tokens = x[:, :, :-1, :]  # [batch_size, S, F, E] where F=n_vars
+    
+    # Return with observation dimension intact
+    # Now feature_tokens[b, s, i, :] is the embedding for variable i at observation s in graph b
+    return feature_tokens  # [batch_size, S, n_vars, E]
 
 
 # ----------------------------
@@ -794,27 +990,46 @@ def compute_sid_safe(y_true: np.ndarray, y_pred: np.ndarray, edge_direction: str
 # ----------------------------
 
 class CausalDecoderLightningModule(pl.LightningModule):
-    """PyTorch Lightning module for causal graph decoder training."""
+    """PyTorch Lightning module for causal graph decoder training with new transformer architecture."""
     
     def __init__(
         self,
         cfg: DemoConfig,
         h: Hyperparameters,
         backbone: nn.Module,
+        config: Any,
         emb_dim: int,
     ):
         super().__init__()
         self.cfg = cfg
         self.h = h
         self.backbone = backbone
-        self.decoder = CausalGraphDecoder(emb_dim)
+        self.config = config
+        
+        # Determine embedding dimension for causal transformer
+        causal_emb_dim = h.causal_emb_dim or emb_dim
+        
+        # New causal transformer with prompt tokens
+        self.causal_transformer = CausalTransformer(
+            config=config,  # Use TabPFN config from checkpoint
+            num_layers=h.causal_transformer_layers,
+            num_prompt_tokens=h.num_prompt_tokens,
+            emb_dim=causal_emb_dim,
+        )
+        
+        # Optional projection layer if dimensions differ
+        self.emb_projection = None
+        if h.causal_emb_dim and h.causal_emb_dim != emb_dim:
+            self.emb_projection = nn.Linear(emb_dim, h.causal_emb_dim)
+        
+        self.decoder = CausalGraphDecoder(causal_emb_dim)
         
         # Freeze backbone
         for p in self.backbone.parameters():
             p.requires_grad_(False)
         self.backbone.eval()
         
-        # Initialize Polyak-averaged parameters (EMA)
+        # Initialize Polyak-averaged parameters (EMA) for trainable components only
         self.register_buffer('ave_params_initialized', torch.tensor(False))
         self.ave_params: dict[str, torch.Tensor] = {}
         
@@ -827,19 +1042,40 @@ class CausalDecoderLightningModule(pl.LightningModule):
     
     @override
     def forward(self, batch_X: list[np.ndarray], batch_interv_mask: list[np.ndarray]) -> torch.Tensor:  # type: ignore[override]
-        """Forward pass: get node embeddings and decode to logits."""
-        node_emb_batch = get_node_embeddings_from_tabpfn_batched(
-            self.backbone, batch_X, batch_interv_mask
+        """Forward pass: get intermediate embeddings, process through causal transformer, and decode to logits."""
+        # Extract intermediate representations from TabPFN
+        node_emb = get_node_embeddings_from_intermediate_layer(
+            self.backbone, batch_X, batch_interv_mask,
+            intermediate_layer_idx=self.h.intermediate_layer_idx
         )
-        logits = self.decoder(node_emb_batch)
+        
+        # Optional projection
+        if self.emb_projection:
+            node_emb = self.emb_projection(node_emb)
+        
+        # Process through new transformer with prompt tokens
+        enhanced_emb = self.causal_transformer(node_emb)
+        
+        # Decode to adjacency logits
+        logits = self.decoder(enhanced_emb)
         return logits
     
     @override
     def training_step(self, batch: dict[str, Any], batch_idx: int) -> torch.Tensor:  # type: ignore[override]
         """Training step."""
-        # Initialize Polyak-averaged parameters on first step
+        # Initialize Polyak-averaged parameters on first step for all trainable components
         if not self.ave_params_initialized:
-            self.ave_params = {name: param.clone().detach() for name, param in self.decoder.named_parameters()}
+            self.ave_params = {}
+            # Include decoder parameters
+            for name, param in self.decoder.named_parameters():
+                self.ave_params[f"decoder.{name}"] = param.clone().detach()
+            # Include causal transformer parameters
+            for name, param in self.causal_transformer.named_parameters():
+                self.ave_params[f"causal_transformer.{name}"] = param.clone().detach()
+            # Include projection layer if it exists
+            if self.emb_projection:
+                for name, param in self.emb_projection.named_parameters():
+                    self.ave_params[f"emb_projection.{name}"] = param.clone().detach()
             self.ave_params_initialized = torch.tensor(True)
         
         # Extract batch data
@@ -889,10 +1125,18 @@ class CausalDecoderLightningModule(pl.LightningModule):
         wgt_acyc = acyc_weight * acyc_penalty
         loss = bce + wgt_acyc
         
-        # Update Polyak-averaged parameters (EMA)
+        # Update Polyak-averaged parameters (EMA) for all trainable components
         with torch.no_grad():
+            # Update decoder parameters
             for name, param in self.decoder.named_parameters():
-                self.ave_params[name].mul_(1 - self.h.polyak_step_size).add_(param, alpha=self.h.polyak_step_size)
+                self.ave_params[f"decoder.{name}"].mul_(1 - self.h.polyak_step_size).add_(param, alpha=self.h.polyak_step_size)
+            # Update causal transformer parameters
+            for name, param in self.causal_transformer.named_parameters():
+                self.ave_params[f"causal_transformer.{name}"].mul_(1 - self.h.polyak_step_size).add_(param, alpha=self.h.polyak_step_size)
+            # Update projection layer if it exists
+            if self.emb_projection:
+                for name, param in self.emb_projection.named_parameters():
+                    self.ave_params[f"emb_projection.{name}"].mul_(1 - self.h.polyak_step_size).add_(param, alpha=self.h.polyak_step_size)
         
         # Update dual variable (for dual schedule)
         if self.h.acyclicity_schedule == "dual":
@@ -983,10 +1227,21 @@ class CausalDecoderLightningModule(pl.LightningModule):
         G_batch = batch['G']
         
         # Use Polyak-averaged parameters for evaluation
+        original_params = {}
         if self.ave_params_initialized:
-            original_params = {name: param.clone() for name, param in self.decoder.named_parameters()}
+            # Save original decoder parameters
             for name, param in self.decoder.named_parameters():
-                param.data.copy_(self.ave_params[name])
+                original_params[f"decoder.{name}"] = param.clone()
+                param.data.copy_(self.ave_params[f"decoder.{name}"])
+            # Save original causal transformer parameters
+            for name, param in self.causal_transformer.named_parameters():
+                original_params[f"causal_transformer.{name}"] = param.clone()
+                param.data.copy_(self.ave_params[f"causal_transformer.{name}"])
+            # Save original projection layer parameters if it exists
+            if self.emb_projection:
+                for name, param in self.emb_projection.named_parameters():
+                    original_params[f"emb_projection.{name}"] = param.clone()
+                    param.data.copy_(self.ave_params[f"emb_projection.{name}"])
         
         # Forward pass
         logits = self(batch_X, batch_interv_mask)
@@ -994,8 +1249,16 @@ class CausalDecoderLightningModule(pl.LightningModule):
         
         # Restore original parameters
         if self.ave_params_initialized:
+            # Restore decoder parameters
             for name, param in self.decoder.named_parameters():
-                param.data.copy_(original_params[name])
+                param.data.copy_(original_params[f"decoder.{name}"])
+            # Restore causal transformer parameters
+            for name, param in self.causal_transformer.named_parameters():
+                param.data.copy_(original_params[f"causal_transformer.{name}"])
+            # Restore projection layer parameters if it exists
+            if self.emb_projection:
+                for name, param in self.emb_projection.named_parameters():
+                    param.data.copy_(original_params[f"emb_projection.{name}"])
         
         # Compute metrics for each graph in batch
         all_metrics = []
@@ -1037,9 +1300,16 @@ class CausalDecoderLightningModule(pl.LightningModule):
     
     @override
     def configure_optimizers(self) -> Union[optim.Optimizer, dict[str, Any]]:  # type: ignore[override]
-        """Configure optimizer and learning rate scheduler."""
+        """Configure optimizer and learning rate scheduler for all trainable components."""
+        # Collect parameters from all trainable components
+        trainable_params = []
+        trainable_params.extend(list(self.decoder.parameters()))
+        trainable_params.extend(list(self.causal_transformer.parameters()))
+        if self.emb_projection:
+            trainable_params.extend(list(self.emb_projection.parameters()))
+        
         optimizer = optim.AdamW(
-            self.decoder.parameters(),
+            trainable_params,
             lr=self.h.lr,
             weight_decay=self.h.weight_decay
         )
@@ -1140,7 +1410,7 @@ def train_demo(cfg: DemoConfig, h: Hyperparameters) -> dict[str, float]:
         batch_size=h.batch_size,
         shuffle=False,
         collate_fn=collate_causal_graphs,
-        num_workers=0,
+        num_workers=8,
         pin_memory=torch.cuda.is_available(),
     )
     
@@ -1157,12 +1427,12 @@ def train_demo(cfg: DemoConfig, h: Hyperparameters) -> dict[str, float]:
         pin_memory=torch.cuda.is_available(),
     )
     
-    # 4) Build backbone
-    backbone = build_tabpfn_backbone(cfg)
+    # 4) Build backbone and get config
+    backbone, config = build_tabpfn_backbone(cfg)
     emb_dim = int(getattr(backbone, "ninp", h.emsize))
     
     # 5) Create Lightning module
-    pl_module = CausalDecoderLightningModule(cfg, h, backbone, emb_dim)
+    pl_module = CausalDecoderLightningModule(cfg, h, backbone, config, emb_dim)
     
     # 6) Create callbacks
     # Built-in checkpoint callback - saves model every N steps
@@ -1205,9 +1475,7 @@ def train_demo(cfg: DemoConfig, h: Hyperparameters) -> dict[str, float]:
         'f1': final_metrics[0]['val_f1'],
         'sid': final_metrics[0]['val_sid'],
         'sid_normalised': final_metrics[0]['val_sid_normalised'],
-        'shd': final_metrics[0]['val_shd'],
         'is_dag': final_metrics[0]['val_is_dag'],
-        'has_cycles': final_metrics[0]['val_has_cycles'],
     }
     
     return metrics
